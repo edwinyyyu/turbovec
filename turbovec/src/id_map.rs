@@ -74,6 +74,30 @@ impl IdMapIndex {
         })
     }
 
+    /// Wrap a prepared empty inner index. Used by the disk index to make
+    /// its in-RAM delta inherit the base segment's TQ+ calibration, so
+    /// delta and base scores stay in the same calibrated coordinate
+    /// system.
+    pub(crate) fn from_inner(inner: TurboQuantIndex) -> Self {
+        assert!(
+            inner.is_empty(),
+            "IdMapIndex::from_inner requires an empty inner index",
+        );
+        Self {
+            inner,
+            slot_to_id: Vec::new(),
+            id_to_slot: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn inner(&self) -> &TurboQuantIndex {
+        &self.inner
+    }
+
+    pub(crate) fn slot_to_id_slice(&self) -> &[u64] {
+        &self.slot_to_id
+    }
+
     /// Add `n = vectors.len() / dim` vectors with the given external ids.
     /// Requires the inner index's dim to already be set (eager constructor
     /// or a previous lazy add).

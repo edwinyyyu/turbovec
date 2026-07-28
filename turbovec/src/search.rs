@@ -1164,6 +1164,7 @@ unsafe fn score_4query_block_neon(
 
 /// Per-query nibble LUTs for NEON scoring (works for 2-bit and 4-bit).
 
+#[derive(Clone)]
 struct QueryNeonLut {
     uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
     scale: f32,
@@ -1455,40 +1456,44 @@ fn calibrate_queries(
     (q_calib, bias_corrs)
 }
 
-/// Full search: rotation + LUT build + scoring + heap top-k.
-///
-/// `mask`: optional packed bitset over slots (one bit per vector,
-/// little-endian within each u64). When `Some`, only slots with their bit set
-/// contribute to the top-k. The returned per-query result count is
-/// `min(k, popcount(mask))`.
-///
-/// Returns (scores_flat, indices_flat) each of length nq * effective_k.
-pub fn search(
+/// Queries prepared for scanning: rotated, TQ+-calibrated, and baked
+/// into per-query nibble LUTs. Preparing is independent of the code
+/// segment being scanned, so a partitioned index prepares once and
+/// scans many segments.
+pub struct PreparedQueries {
+    luts: Vec<QueryNeonLut>,
+    nq: usize,
+}
+
+impl PreparedQueries {
+    pub fn nq(&self) -> usize {
+        self.nq
+    }
+
+    /// A prepared-queries handle holding just query `qi` — used when
+    /// different queries scan different segments (e.g. per-query partition
+    /// routing in the disk index).
+    pub fn single(&self, qi: usize) -> PreparedQueries {
+        PreparedQueries {
+            luts: vec![self.luts[qi].clone()],
+            nq: 1,
+        }
+    }
+}
+
+/// Rotation + TQ+ calibration + LUT build — the per-query half of
+/// [`search`], reusable across multiple [`scan`] calls.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare(
     queries: &[f32],    // (nq, dim) row-major
     nq: usize,
     rotation: &[f32],   // (dim, dim) row-major
-    blocked_codes: &[u8],
     centroids: &[f32],
-    vec_scales: &[f32],
     tqplus_shift: &[f32],     // empty for v2 indexes (identity calibration)
     tqplus_scale: &[f32],     // empty for v2 indexes (identity calibration)
     bits: usize,
     dim: usize,
-    n_vectors: usize,
-    n_blocks: usize,
-    k: usize,
-    mask: Option<&[u64]>,
-) -> (Vec<f32>, Vec<i64>) {
-    let n_allowed = match mask {
-        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
-        None => n_vectors,
-    };
-    let k = k.min(n_allowed);
-    if k == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let n_byte_groups = dim / (8 / bits);
-
+) -> PreparedQueries {
     // Batched rotation: q_rot = queries @ rotation^T via a single GEMM.
     // Much faster than per-query matvec loops because it saturates FMA throughput
     // and reuses the rotation matrix across queries.
@@ -1519,7 +1524,7 @@ pub fn search(
 
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
-    let query_luts: Vec<QueryNeonLut> = (0..nq)
+    let luts: Vec<QueryNeonLut> = (0..nq)
         .into_par_iter()
         .map(|qi| {
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
@@ -1528,6 +1533,69 @@ pub fn search(
             lut
         })
         .collect();
+
+    PreparedQueries { luts, nq }
+}
+
+/// Full search: rotation + LUT build + scoring + heap top-k.
+///
+/// `mask`: optional packed bitset over slots (one bit per vector,
+/// little-endian within each u64). When `Some`, only slots with their bit set
+/// contribute to the top-k. The returned per-query result count is
+/// `min(k, popcount(mask))`.
+///
+/// Returns (scores_flat, indices_flat) each of length nq * effective_k.
+#[allow(clippy::too_many_arguments)]
+pub fn search(
+    queries: &[f32],    // (nq, dim) row-major
+    nq: usize,
+    rotation: &[f32],   // (dim, dim) row-major
+    blocked_codes: &[u8],
+    centroids: &[f32],
+    vec_scales: &[f32],
+    tqplus_shift: &[f32],     // empty for v2 indexes (identity calibration)
+    tqplus_scale: &[f32],     // empty for v2 indexes (identity calibration)
+    bits: usize,
+    dim: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+) -> (Vec<f32>, Vec<i64>) {
+    let prepared = prepare(
+        queries, nq, rotation, centroids, tqplus_shift, tqplus_scale, bits, dim,
+    );
+    scan(
+        &prepared, blocked_codes, vec_scales, bits, dim, n_vectors, n_blocks, k, mask,
+    )
+}
+
+/// Score prepared queries against one blocked code segment and return the
+/// per-query top-k. The scanning half of [`search`]; indices are local to
+/// the segment.
+#[allow(clippy::too_many_arguments)]
+pub fn scan(
+    prepared: &PreparedQueries,
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    bits: usize,
+    dim: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+) -> (Vec<f32>, Vec<i64>) {
+    let nq = prepared.nq;
+    let query_luts = &prepared.luts;
+    let n_allowed = match mask {
+        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
+        None => n_vectors,
+    };
+    let k = k.min(n_allowed);
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let n_byte_groups = dim / (8 / bits);
 
     // Platform-specific scoring + top-k
     #[cfg(target_arch = "aarch64")]

@@ -21,6 +21,12 @@ rand_distr = "0.4"
 statrs = "0.17"
 faer = "0.20"
 
+# DiskIndex maps index sections directly into memory, which assumes the
+# on-disk little-endian encoding matches the host; the module (and this
+# dependency) are compiled out on big-endian targets.
+[target.'cfg(target_endian = "little")'.dependencies]
+memmap2 = "0.9"
+
 # build.rs emits the BLAS link directive directly (openblas on Linux,
 # Accelerate framework on macOS) so downstream binaries don't need to
 # include `extern crate blas_src;` to resolve `cblas_sgemm`.
