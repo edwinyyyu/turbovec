@@ -80,6 +80,23 @@ pub mod fresh;
 pub mod kmeans;
 pub mod linalg;
 
+/// Test-only surface for the coarse quantizer. `kmeans` is crate-private, but
+/// the hierarchy's agreement with exact assignment is exactly the property
+/// that needs an integration test.
+#[doc(hidden)]
+pub mod kmeans_test_api {
+    pub use crate::kmeans::CoarseIndex;
+    pub fn assign_flat(
+        data: &[f32],
+        n: usize,
+        dim: usize,
+        centroids: &[f32],
+        k: usize,
+    ) -> Vec<u32> {
+        crate::kmeans::assign(data, n, dim, centroids, k).0
+    }
+}
+
 pub use disk::{DiskIndex, SearchOptions};
 pub use fresh::{FreshIndex, FreshReader, Snapshot};
 

@@ -220,3 +220,191 @@ mod tests {
         }
     }
 }
+
+/// Two-level coarse quantizer over the partition centroids.
+///
+/// Assignment scores every row against every centroid, so per-row cost is
+/// O(nlist·dim) and, because nlist grows linearly with N at a fixed partition
+/// size, bulk construction is O(N²). That is the shape every billion-scale
+/// system avoids by making the coarse quantizer an index rather than a linear
+/// scan (FAISS `IVF..._HNSW`, SPANN, DiskANN).
+///
+/// A GEMM hierarchy is used here rather than a graph, because the workload is
+/// BATCH assignment of many rows, not one lookup at a time. Both levels stay
+/// dense matrix multiplies — SIMD, cache-friendly, amortized across the batch —
+/// where a graph would give one pointer-chasing walk per row.
+///
+/// Cost per row falls from `nlist` to `n_super + probe·members ≈ 2·√nlist`,
+/// i.e. a factor of about `√nlist / 2`: ~14x at nlist 781, ~39x at 6,300,
+/// ~156x at 97,656. RAM is `√nlist·dim·4` — 958 KB at nlist 97,656 × 768d,
+/// against 300 MB of centroids — and the search path is untouched.
+///
+/// The cost is that assignment becomes APPROXIMATE: a row can land in a
+/// partition that is not its true nearest. `probe_super` trades that back, and
+/// LIRE's reassignment pass corrects residual error over time.
+pub struct CoarseIndex {
+    /// nlist this was built for; rebuilt when the partition count has moved
+    /// materially, not on every centroid touch.
+    pub built_for: usize,
+    n_super: usize,
+    dim: usize,
+    supers: Vec<f32>,
+    /// Centroid ids owned by each super, flattened with offsets so the hot
+    /// path indexes a slice rather than chasing a `Vec<Vec<_>>`.
+    member_offsets: Vec<u32>,
+    members: Vec<u32>,
+}
+
+impl CoarseIndex {
+    pub fn build(centroids: &[f32], nlist: usize, dim: usize, seed: u64) -> Self {
+        let n_super = (nlist as f64).sqrt().ceil().max(1.0) as usize;
+        let n_super = n_super.min(nlist);
+        // Few iterations on purpose: this clusters CENTROIDS, which are
+        // already a summary, and a better super level buys accuracy the
+        // `probe_super` dial buys more cheaply.
+        let (supers, owner) = kmeans(centroids, nlist, dim, n_super, 4, seed);
+        let n_super = supers.len() / dim.max(1);
+
+        let mut counts = vec![0u32; n_super];
+        for &s in &owner {
+            counts[s as usize] += 1;
+        }
+        let mut member_offsets = Vec::with_capacity(n_super + 1);
+        let mut acc = 0u32;
+        for &c in &counts {
+            member_offsets.push(acc);
+            acc += c;
+        }
+        member_offsets.push(acc);
+        let mut cursor = member_offsets.clone();
+        let mut members = vec![0u32; nlist];
+        for (cid, &s) in owner.iter().enumerate() {
+            let slot = &mut cursor[s as usize];
+            members[*slot as usize] = cid as u32;
+            *slot += 1;
+        }
+        Self {
+            built_for: nlist,
+            n_super,
+            dim,
+            supers,
+            member_offsets,
+            members,
+        }
+    }
+
+    /// Assign `n` rows to centroids through the hierarchy.
+    ///
+    /// Rows are grouped by their chosen super before the second level so that
+    /// stage stays a GEMM per group rather than a per-row gather.
+    pub fn assign(
+        &self,
+        data: &[f32],
+        n: usize,
+        centroids: &[f32],
+        probe_super: usize,
+    ) -> Vec<u32> {
+        let dim = self.dim;
+        if n == 0 || self.n_super == 0 {
+            return vec![0u32; n];
+        }
+        let probe = probe_super.clamp(1, self.n_super);
+
+        // Level 1: every row against every super. One GEMM.
+        let sup_scores = crate::linalg::matmul_nt_ex(
+            data,
+            n,
+            dim,
+            &self.supers,
+            self.n_super,
+            Some(true),
+        );
+        let sup_sq: Vec<f32> = (0..self.n_super)
+            .map(|s| self.supers[s * dim..(s + 1) * dim].iter().map(|v| v * v).sum())
+            .collect();
+
+        // Rank each row's supers, keeping the top `probe`.
+        //
+        // probe=1 is not enough: a row near a super boundary has its true
+        // nearest centroid in the NEIGHBOURING super, and measured agreement
+        // with exact assignment was only 37% at nlist 256. Probing several
+        // supers is the accuracy dial, and it stays cheap because each round
+        // is still one GEMM per group.
+        let mut ranked = vec![0u32; n * probe];
+        {
+            let mut scratch: Vec<(f32, u32)> = Vec::with_capacity(self.n_super);
+            for i in 0..n {
+                let row = &sup_scores[i * self.n_super..(i + 1) * self.n_super];
+                scratch.clear();
+                scratch.extend((0..self.n_super).map(|s| (sup_sq[s] - 2.0 * row[s], s as u32)));
+                if probe < self.n_super {
+                    scratch.select_nth_unstable_by(probe - 1, |a, b| a.0.total_cmp(&b.0));
+                }
+                scratch[..probe].sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                for p in 0..probe {
+                    ranked[i * probe + p] = scratch[p].1;
+                }
+            }
+        }
+
+        let cent_sq: Vec<f32> = (0..centroids.len() / dim)
+            .map(|c| centroids[c * dim..(c + 1) * dim].iter().map(|v| v * v).sum())
+            .collect();
+
+        // Level 2, one ROUND per probed super. Within a round, rows are grouped
+        // by which super they are visiting, so the scoring stays a GEMM per
+        // group rather than a per-row gather -- the reason a hierarchy beats a
+        // graph for batch assignment. Rounds keep a running best.
+        let mut out = vec![0u32; n];
+        let mut best_score = vec![f32::INFINITY; n];
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        for p in 0..probe {
+            order.sort_unstable_by_key(|&i| ranked[i as usize * probe + p]);
+            let mut pos = 0usize;
+            while pos < n {
+                let s = ranked[order[pos] as usize * probe + p] as usize;
+                let mut end = pos;
+                while end < n && ranked[order[end] as usize * probe + p] as usize == s {
+                    end += 1;
+                }
+                let rows = &order[pos..end];
+                let lo = self.member_offsets[s] as usize;
+                let hi = self.member_offsets[s + 1] as usize;
+                let member_ids = &self.members[lo..hi];
+                if member_ids.is_empty() {
+                    pos = end;
+                    continue;
+                }
+
+                let mut a = Vec::with_capacity(rows.len() * dim);
+                for &i in rows {
+                    a.extend_from_slice(&data[i as usize * dim..(i as usize + 1) * dim]);
+                }
+                let mut b = Vec::with_capacity(member_ids.len() * dim);
+                for &cid in member_ids {
+                    b.extend_from_slice(&centroids[cid as usize * dim..(cid as usize + 1) * dim]);
+                }
+                let prod = crate::linalg::matmul_nt_ex(
+                    &a,
+                    rows.len(),
+                    dim,
+                    &b,
+                    member_ids.len(),
+                    Some(true),
+                );
+                for (r, &i) in rows.iter().enumerate() {
+                    let row = &prod[r * member_ids.len()..(r + 1) * member_ids.len()];
+                    for (m, &cid) in member_ids.iter().enumerate() {
+                        let score = cent_sq[cid as usize] - 2.0 * row[m];
+                        if score < best_score[i as usize] {
+                            best_score[i as usize] = score;
+                            out[i as usize] = cid;
+                        }
+                    }
+                }
+                pos = end;
+            }
+        }
+        out
+    }
+}

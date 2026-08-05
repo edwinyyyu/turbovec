@@ -414,6 +414,21 @@ pub struct MaintenanceTuning {
     /// which at 768d runs at ~0.64 ms per 50k rows, so a 100k staging tier
     /// adds ~1.3 ms to every query. Bound it accordingly.
     pub staging_threshold: usize,
+    /// Route ingest assignment through a two-level coarse quantizer instead of
+    /// scanning every centroid (`kmeans::CoarseIndex`).
+    ///
+    /// Assignment is O(nlist·dim) per row and nlist grows with N, so bulk
+    /// construction is O(N²) — measured N^2.03, and off the field at scale
+    /// (~670 h projected at 100M against DiskANN's ~1.4 h for 1B). The
+    /// hierarchy makes it ~O(√nlist·dim), which is what every billion-scale
+    /// system does.
+    ///
+    /// OFF by default because it makes assignment APPROXIMATE: a row can land
+    /// in a partition that is not its true nearest. That is a recall question,
+    /// not a correctness one — every row is still findable, and reassignment
+    /// corrects drift — but it must be measured per corpus before it is
+    /// trusted, and the flat path stays the reference.
+    pub hierarchical_assign: bool,
     /// Fold trailing small chunks by appending a merged chunk instead of
     /// rewriting the partition (`tier_merge`). Off reproduces the pre-fix
     /// compaction behaviour, which is the only reason the flag exists.
@@ -484,6 +499,7 @@ impl Default for MaintenanceTuning {
             // reassignment's quality gain reach the latency axis at all.
             gc_max_chunks: 4,
             staging_threshold: 0,
+            hierarchical_assign: false,
             tier_merge_enabled: true,
             gc_garbage_ratio: 0.5,
             max_rewrites_per_flush: 0,
@@ -597,6 +613,8 @@ pub struct MaintenanceStats {
     /// batch size the caller passed is how a 5x discrepancy went unnoticed.
     pub assign_rows: u64,
     pub assign_nlist: u64,
+    /// Times the two-level coarse quantizer was rebuilt.
+    pub coarse_rebuilds: u64,
 }
 
 /// Why a chunk is being written. Attribution only -- it does not change what
@@ -627,6 +645,16 @@ const TIER_MERGE_CHUNK_BACKSTOP: usize = 24;
 /// Run-count ceiling that still forces an all-runs merge. Tiering holds the
 /// count at O(log entries); this only fires if it is not keeping up.
 const RUN_TIER_BACKSTOP: usize = 24;
+
+/// Below this many partitions a flat scan is already cheap and the hierarchy's
+/// own build cost dominates, so it stays off.
+const HIERARCHY_MIN_NLIST: usize = 256;
+
+/// Supers probed per row in the two-level assignment. The accuracy dial:
+/// agreement with exact assignment is ~33% at 1, ~85% at 8 (nlist 1024).
+/// Cost is `(1 + probe)·√nlist` comparisons against `nlist` flat, so the
+/// win still grows with nlist — ~9x at 6,300 partitions, ~35x at 97,656.
+const HIERARCHY_PROBE_SUPER: usize = 8;
 
 /// Largest tolerated size ratio between the two children of a split.
 const SPLIT_BALANCE_RATIO: f32 = 1.5;
@@ -1468,6 +1496,10 @@ pub struct FreshIndex {
     /// Previous centroid blob, unlinked once the manifest naming its
     /// replacement has been renamed into place.
     retired_centroids: Option<PathBuf>,
+    /// Two-level quantizer over the centroids, rebuilt when nlist has moved
+    /// materially rather than on every centroid touch — it clusters a summary,
+    /// so a slightly stale level costs a little accuracy, not correctness.
+    coarse: Option<kmeans::CoarseIndex>,
     next_partition_id: u32,
     next_run_generation: u64,
     churn_since_check: u64,
@@ -1533,6 +1565,7 @@ impl FreshIndex {
             centroids_generation: 0,
             centroids_dirty: true,
             retired_centroids: None,
+            coarse: None,
             next_partition_id: 0,
             next_run_generation: 0,
             churn_since_check: 0,
@@ -2251,17 +2284,49 @@ impl FreshIndex {
         let vectors = self.batch_vectors(batch, dim);
         self.stats.us_assign_decode = t_dec.elapsed().as_micros() as u64;
         let t_gemm = std::time::Instant::now();
-        // Top of a flush, one large batch, not inside any parallel loop: take
-        // every core. The ambient check cannot see this, because the extension
-        // runs the whole save inside an installed pool.
-        let (assignments, _) = kmeans::assign_ex(
-            &vectors,
-            batch.n,
-            dim,
-            &self.state.centroids,
-            nlist,
-            Some(true),
-        );
+        let assignments = if self.tuning.hierarchical_assign && nlist >= HIERARCHY_MIN_NLIST {
+            // Rebuild when nlist has moved more than 20%: the level clusters
+            // centroids, which are themselves a summary, so it tolerates being
+            // a little stale far better than it tolerates being rebuilt every
+            // save.
+            let stale = match &self.coarse {
+                None => true,
+                Some(c) => {
+                    let grown = nlist.max(c.built_for) as f64;
+                    let shrunk = nlist.min(c.built_for) as f64;
+                    grown / shrunk.max(1.0) > 1.2
+                }
+            };
+            if stale {
+                self.coarse = Some(kmeans::CoarseIndex::build(
+                    &self.state.centroids,
+                    nlist,
+                    dim,
+                    KMEANS_SEED ^ nlist as u64,
+                ));
+                self.stats.coarse_rebuilds += 1;
+            }
+            let coarse = self.coarse.as_ref().expect("just built");
+            // Agreement with exact assignment at probe=1 is only ~33-37%
+            // (Voronoi boundaries: a row's nearest centroid often sits in the
+            // neighbouring super). 8 lifts it to 85-95%, and recall tolerates
+            // more than agreement does because search probes many partitions
+            // anyway.
+            coarse.assign(&vectors, batch.n, &self.state.centroids, HIERARCHY_PROBE_SUPER)
+        } else {
+            // Top of a flush, one large batch, not inside any parallel loop:
+            // take every core. The ambient check cannot see this, because the
+            // extension runs the whole save inside an installed pool.
+            kmeans::assign_ex(
+                &vectors,
+                batch.n,
+                dim,
+                &self.state.centroids,
+                nlist,
+                Some(true),
+            )
+            .0
+        };
         self.stats.us_assign_gemm = t_gemm.elapsed().as_micros() as u64;
         self.stats.assign_rows = batch.n as u64;
         self.stats.assign_nlist = nlist as u64;

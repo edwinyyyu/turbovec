@@ -2448,7 +2448,7 @@ impl FreshIndex {
     /// index has always used; they exist so the choices can be measured on
     /// this implementation rather than on a reimplementation of it.
     #[new]
-    #[pyo3(signature = (dim=None, bit_width=4, target_partition_size=None, store_vectors=false, replica_epsilon=None, reassign_neighbors=None, balanced_split=None, resplit_after_reassign=None, replica_prune=None, split_enabled=None, dissolve_enabled=None, reassign_enabled=None, rebootstrap_enabled=None, gc_max_chunks=None, gc_dead_ratio=None, tier_merge_enabled=None, gc_garbage_ratio=None, staging_threshold=None, max_rewrites_per_flush=None, max_reassign_partitions=None, defer_maintenance=None))]
+    #[pyo3(signature = (dim=None, bit_width=4, target_partition_size=None, store_vectors=false, replica_epsilon=None, reassign_neighbors=None, balanced_split=None, resplit_after_reassign=None, replica_prune=None, split_enabled=None, dissolve_enabled=None, reassign_enabled=None, rebootstrap_enabled=None, gc_max_chunks=None, gc_dead_ratio=None, tier_merge_enabled=None, gc_garbage_ratio=None, staging_threshold=None, hierarchical_assign=None, max_rewrites_per_flush=None, max_reassign_partitions=None, defer_maintenance=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         dim: Option<usize>,
@@ -2469,6 +2469,7 @@ impl FreshIndex {
         tier_merge_enabled: Option<bool>,
         gc_garbage_ratio: Option<f64>,
         staging_threshold: Option<usize>,
+        hierarchical_assign: Option<bool>,
         max_rewrites_per_flush: Option<usize>,
         max_reassign_partitions: Option<usize>,
         defer_maintenance: Option<bool>,
@@ -2519,6 +2520,9 @@ impl FreshIndex {
         }
         if let Some(v) = gc_max_chunks {
             tuning.gc_max_chunks = v;
+        }
+        if let Some(v) = hierarchical_assign {
+            tuning.hierarchical_assign = v;
         }
         if let Some(v) = staging_threshold {
             tuning.staging_threshold = v;
@@ -2953,6 +2957,7 @@ impl FreshIndex {
             ("us_assign_gemm", s.us_assign_gemm as f64),
             ("assign_rows", s.assign_rows as f64),
             ("assign_nlist", s.assign_nlist as f64),
+            ("coarse_rebuilds", s.coarse_rebuilds as f64),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
