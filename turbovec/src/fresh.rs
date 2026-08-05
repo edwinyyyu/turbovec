@@ -3426,12 +3426,32 @@ impl FreshIndex {
         let mut paths = std::mem::take(&mut self.pending_syncs);
         paths.sort_unstable();
         paths.dedup();
+
+        // ONE device barrier for the whole batch, not one per file.
+        //
+        // `F_FULLFSYNC` tells the DRIVE to flush its write cache; it is a
+        // device-level command, so a single call covers every byte already
+        // handed to the device. `fsync(2)` is what hands a file's bytes over,
+        // and it is comparatively cheap because it stops there.
+        //
+        // Issuing the device barrier per file made durability cost scale with
+        // the number of partitions a batch touched, which grows with nlist --
+        // measured at 800k x 768d, that was 92% of save wall (6,233 ms against
+        // 496 ms with barriers off) and it was superlinear, because a wider
+        // index spreads the same batch over more files. Per-file `fsync` plus
+        // one barrier gives the same guarantee: every file's data is at the
+        // device before the barrier, and the barrier flushes all of it.
+        let mut last = None;
         for path in &paths {
             // A file may have been dropped by a later split/dissolve in the
             // same flush; nothing to make durable in that case.
             if let Ok(file) = OpenOptions::new().write(true).open(path) {
-                full_sync(&file)?;
+                file.sync_all()?;
+                last = Some(file);
             }
+        }
+        if let Some(file) = last {
+            full_sync(&file)?;
         }
         Ok(())
     }
