@@ -593,6 +593,10 @@ pub struct MaintenanceStats {
     /// assign path and are per-flush gauges like the rest.
     pub us_assign_decode: u64,
     pub us_assign_gemm: u64,
+    /// The SHAPE the ingest assign GEMM actually ran at. Inferring it from the
+    /// batch size the caller passed is how a 5x discrepancy went unnoticed.
+    pub assign_rows: u64,
+    pub assign_nlist: u64,
 }
 
 /// Why a chunk is being written. Attribution only -- it does not change what
@@ -2054,6 +2058,8 @@ impl FreshIndex {
         self.stats.us_publish = 0;
         self.stats.us_assign_decode = 0;
         self.stats.us_assign_gemm = 0;
+        self.stats.assign_rows = 0;
+        self.stats.assign_nlist = 0;
 
         let mut entries: Vec<RunEntry> = Vec::new();
         let mut dropped_files: Vec<PathBuf> = Vec::new();
@@ -2245,8 +2251,20 @@ impl FreshIndex {
         let vectors = self.batch_vectors(batch, dim);
         self.stats.us_assign_decode = t_dec.elapsed().as_micros() as u64;
         let t_gemm = std::time::Instant::now();
-        let (assignments, _) = kmeans::assign(&vectors, batch.n, dim, &self.state.centroids, nlist);
+        // Top of a flush, one large batch, not inside any parallel loop: take
+        // every core. The ambient check cannot see this, because the extension
+        // runs the whole save inside an installed pool.
+        let (assignments, _) = kmeans::assign_ex(
+            &vectors,
+            batch.n,
+            dim,
+            &self.state.centroids,
+            nlist,
+            Some(true),
+        );
         self.stats.us_assign_gemm = t_gemm.elapsed().as_micros() as u64;
+        self.stats.assign_rows = batch.n as u64;
+        self.stats.assign_nlist = nlist as u64;
         assignments
     }
 

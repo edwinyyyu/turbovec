@@ -32,6 +32,20 @@ pub(crate) fn assign(
     centroids: &[f32],
     k: usize,
 ) -> (Vec<u32>, Vec<f32>) {
+    assign_ex(data, n, dim, centroids, k, None)
+}
+
+/// `assign` with the GEMM's parallelism chosen by the caller. Ingest assigns
+/// one large batch from the top of a flush and wants every core; maintenance
+/// assigns per partition from inside a `par_iter` and must stay serial.
+pub(crate) fn assign_ex(
+    data: &[f32],
+    n: usize,
+    dim: usize,
+    centroids: &[f32],
+    k: usize,
+    parallel: Option<bool>,
+) -> (Vec<u32>, Vec<f32>) {
     assert_eq!(data.len(), n * dim);
     assert_eq!(centroids.len(), k * dim);
     assert!(k > 0);
@@ -48,7 +62,7 @@ pub(crate) fn assign(
         .collect();
 
     let t_gemm = std::time::Instant::now();
-    let products = crate::linalg::matmul_nt(data, n, dim, centroids, k); // (n, k)
+    let products = crate::linalg::matmul_nt_ex(data, n, dim, centroids, k, parallel); // (n, k)
     let gemm_us = t_gemm.elapsed().as_micros() as u64;
     GEMM_US.fetch_add(gemm_us, AtOrd::Relaxed);
 

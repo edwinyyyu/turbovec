@@ -63,6 +63,30 @@ fn should_parallelise(work: usize) -> bool {
 /// think in terms of "multiply by Bᵀ" and callers that think "score every row
 /// of A against every row of B" want the same function.
 pub fn matmul_nt(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32> {
+    matmul_nt_ex(a, m, k, b, n, None)
+}
+
+/// `matmul_nt` with the parallelism decision made by the CALLER.
+///
+/// The ambient `should_parallelise` check asks "am I inside a rayon worker?",
+/// which cannot tell a top-level call that merely runs inside an installed
+/// pool from one nested inside a parallel loop body. Both look identical to
+/// `current_thread_index()`. The first should parallelise and the second must
+/// not, so callers that know which they are say so.
+///
+/// This matters because the Python extension pins rayon's GLOBAL pool to one
+/// thread and runs real work in a process-local pool via `with_pool`. Inside
+/// that pool the ambient check says "nested", and the whole write path ran
+/// single-threaded: measured 24 GMAC/s against 130 for the same shape once the
+/// decision is explicit.
+pub fn matmul_nt_ex(
+    a: &[f32],
+    m: usize,
+    k: usize,
+    b: &[f32],
+    n: usize,
+    parallel: Option<bool>,
+) -> Vec<f32> {
     assert_eq!(a.len(), m * k, "a is not m*k");
     assert_eq!(b.len(), n * k, "b is not n*k");
     let mut c = vec![0.0f32; m * n];
@@ -110,7 +134,7 @@ pub fn matmul_nt(a: &[f32], m: usize, k: usize, b: &[f32], n: usize) -> Vec<f32>
         .next_multiple_of(MR)
         .min(m.max(1));
     let work = m * n * k;
-    if should_parallelise(work) {
+    if parallel.unwrap_or_else(|| should_parallelise(work)) && work >= PARALLEL_THRESHOLD {
         c.par_chunks_mut(mblock * n)
             .enumerate()
             .for_each(|(blk, c_block)| {

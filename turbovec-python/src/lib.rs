@@ -2600,11 +2600,13 @@ impl FreshIndex {
         let owned_i = i_slice.to_vec();
         let inner = std::sync::Arc::clone(&self.inner);
         py.detach(move || {
-            inner
-                .write()
-                .expect("FreshIndex lock poisoned")
-                .add_with_ids_2d(&owned_v, dim, &owned_i)
-        })
+            with_pool(move || {
+                inner
+                    .write()
+                    .expect("FreshIndex lock poisoned")
+                    .add_with_ids_2d(&owned_v, dim, &owned_i)
+            })
+        })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -2758,8 +2760,10 @@ impl FreshIndex {
     /// while work may remain, so callers can loop until it returns False.
     fn maintain(&self, py: Python<'_>) -> PyResult<bool> {
         let inner = std::sync::Arc::clone(&self.inner);
-        py.detach(move || inner.write().expect("FreshIndex lock poisoned").maintain())
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+        py.detach(move || {
+            with_pool(move || inner.write().expect("FreshIndex lock poisoned").maintain())
+        })?
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// True when some partition is outside the size bound.
@@ -2772,11 +2776,18 @@ impl FreshIndex {
         let inner = std::sync::Arc::clone(&self.inner);
         let dir = directory.to_string();
         py.detach(move || {
-            inner
-                .write()
-                .expect("FreshIndex lock poisoned")
-                .save(&dir)
-        })
+            // `with_pool`, not the bare closure: module init pins rayon's
+            // GLOBAL pool to one thread and runs real work in a process-local
+            // one. Without this the whole write path — assign, decode,
+            // maintenance — is single-threaded. Measured on the assign GEMM:
+            // 24 GMAC/s against 130 for the same shape.
+            with_pool(move || {
+                inner
+                    .write()
+                    .expect("FreshIndex lock poisoned")
+                    .save(&dir)
+            })
+        })?
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
@@ -2940,6 +2951,8 @@ impl FreshIndex {
             ("staged_saves", s.staged_saves as f64),
             ("us_assign_decode", s.us_assign_decode as f64),
             ("us_assign_gemm", s.us_assign_gemm as f64),
+            ("assign_rows", s.assign_rows as f64),
+            ("assign_nlist", s.assign_nlist as f64),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
