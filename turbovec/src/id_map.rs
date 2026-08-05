@@ -272,6 +272,31 @@ pub struct IdMapIndex {
 }
 
 impl IdMapIndex {
+    /// Wrap a prepared empty inner index. Used by the disk index to make
+    /// its in-RAM delta inherit the base segment's TQ+ calibration, so
+    /// delta and base scores stay in the same calibrated coordinate
+    /// system.
+    pub(crate) fn from_inner(inner: TurboQuantIndex) -> Self {
+        assert!(
+            inner.is_empty(),
+            "IdMapIndex::from_inner requires an empty inner index",
+        );
+        Self {
+            inner,
+            slot_to_id: Vec::new(),
+            // Upstream additions since this was written: an empty index has
+            // nothing deferred and no load-time id table.
+            id_to_slot: std::sync::OnceLock::new(),
+            deferred_added: std::sync::Mutex::new(Default::default()),
+            sorted_ids: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    pub(crate) fn inner(&self) -> &TurboQuantIndex {
+        &self.inner
+    }
+    pub(crate) fn slot_to_id_slice(&self) -> &[u64] {
+        &self.slot_to_id
+    }
     /// Construct an id-map index with a known dim. The dim is locked at
     /// construction. Propagates the same errors as
     /// [`TurboQuantIndex::new`].

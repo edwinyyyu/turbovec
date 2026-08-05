@@ -2021,6 +2021,946 @@ fn turbovec_package_dir(py: Python<'_>) -> Option<String> {
     Some(dir)
 }
 
+// ---- the partitioned incremental index, ported from the prototype ----
+#[pyclass]
+struct DiskIndex {
+    inner: turbovec_core::DiskIndex,
+}
+
+#[pymethods]
+impl DiskIndex {
+    /// Construct an empty disk-primary index with no backing file yet.
+    /// All vectors live in the in-RAM delta until the first `write`.
+    /// `dim` is optional: when omitted, the dimensionality is committed
+    /// on the first `add_with_ids` call.
+    ///
+    /// `target_partition_size`, when given, enables SPFresh-style
+    /// partitioning at the next `write`: codes are clustered into
+    /// partitions of roughly that many vectors, and searches probe only
+    /// the `nprobe` nearest partitions (approximate routing).
+    ///
+    /// `store_vectors=True` keeps the full-precision vectors alongside the
+    /// quantized codes (the delta's in RAM, the base's in a mmap section),
+    /// enabling exact rescoring (on by default at depth `4 * k` once set)
+    /// and `get_vectors`. Costs `4 * dim` bytes per row of file size;
+    /// resident memory is unaffected. Fixed for the life of the index.
+    ///
+    /// `replica_epsilon`, when given, enables SPANN-style boundary
+    /// multi-assignment on a partitioned index: at each `write`, a vector
+    /// is also stored in every partition whose centroid is within
+    /// `(1 + replica_epsilon)` of its nearest centroid's distance
+    /// (RNG-rule pruned, at most 8 copies), so boundary vectors are
+    /// findable from adjacent partitions at small probe counts.
+    #[new]
+    #[pyo3(signature = (dim=None, bit_width=4, target_partition_size=None, store_vectors=false, replica_epsilon=None, replica_prune=true))]
+    fn new(
+        dim: Option<usize>,
+        bit_width: usize,
+        target_partition_size: Option<usize>,
+        store_vectors: bool,
+        replica_epsilon: Option<f32>,
+        replica_prune: bool,
+    ) -> PyResult<Self> {
+        let mut inner = turbovec_core::DiskIndex::new(dim, bit_width)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        if target_partition_size == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target_partition_size must be positive",
+            ));
+        }
+        if let Some(epsilon) = replica_epsilon {
+            if !(epsilon.is_finite() && epsilon > 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "replica_epsilon must be finite and positive",
+                ));
+            }
+        }
+        inner.set_partitioning(target_partition_size);
+        inner.set_replication(replica_epsilon);
+        inner.set_replica_prune(replica_prune);
+        inner.set_store_vectors(store_vectors);
+        Ok(Self { inner })
+    }
+
+    /// Open a `.tvdm` file previously produced by `write`. The file is
+    /// memory-mapped: searches run directly over the mapped bytes and the
+    /// index stays resident only through the OS page cache.
+    #[classmethod]
+    fn open(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        let inner = turbovec_core::DiskIndex::open(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+        Ok(Self { inner })
+    }
+
+    /// Convert a `.tvim` `IdMapIndex` file into a `.tvdm` file at `dst`.
+    /// Lossless — codes, scales, calibration and ids carry over, so search
+    /// results are identical. `dst` may equal `src` to convert in place.
+    #[classmethod]
+    fn convert_id_map_file(_cls: &Bound<PyType>, src: &str, dst: &str) -> PyResult<()> {
+        turbovec_core::DiskIndex::convert_id_map_file(src, dst)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+    }
+
+    /// Convert a `.tvdm` file back into a `.tvim` `IdMapIndex` file at
+    /// `dst` — the inverse of `convert_id_map_file`, equally lossless.
+    /// `dst` may equal `src` to convert in place.
+    #[classmethod]
+    fn convert_to_id_map_file(_cls: &Bound<PyType>, src: &str, dst: &str) -> PyResult<()> {
+        turbovec_core::DiskIndex::convert_to_id_map_file(src, dst)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+    }
+
+    /// Add `n = vectors.shape[0]` vectors with the given external `ids`
+    /// into the in-RAM delta. Same contract as `IdMapIndex.add_with_ids`.
+    fn add_with_ids(
+        &mut self,
+        vectors: PyReadonlyArray2<f32>,
+        ids: PyReadonlyArray1<u64>,
+    ) -> PyResult<()> {
+        let v = vectors.as_array();
+        let dim = v.ncols();
+        let v_slice = v.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let i = ids.as_array();
+        let i_slice = i.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
+        self.inner
+            .add_with_ids_2d(v_slice, dim, i_slice)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Remove the vector with external id `id`. Returns `True` if it was
+    /// present. Base-segment removals are tombstoned in RAM and physically
+    /// dropped at the next `write`.
+    fn remove(&mut self, id: u64) -> bool {
+        self.inner.remove(id)
+    }
+
+    /// Search for the top-`k` nearest external ids for each query.
+    ///
+    /// On a partitioned index, `nprobe` caps how many partitions each
+    /// query scans (default `max(4, nlist / 8)`, or `nlist` when
+    /// `probe_epsilon` is given); it is ignored on a flat index, where the
+    /// whole segment is scanned.
+    ///
+    /// `probe_epsilon` enables distance-bounded adaptive probing: each
+    /// query scans every partition whose centroid distance is within
+    /// `(1 + probe_epsilon)` of its nearest centroid's, up to the `nprobe`
+    /// cap. Boundary queries probe more partitions, confident ones fewer.
+    ///
+    /// `rescore_k` controls exact rescoring on an index built with
+    /// `store_vectors`: the merged top `rescore_k` quantized candidates
+    /// are re-ranked by exact f32 inner product (returned scores for those
+    /// rows are the exact products). `None` = `4 * k` when vectors are
+    /// stored, off otherwise; `0` = off.
+    ///
+    /// Returns `(scores, ids)` as `(nq, effective_k)` arrays with
+    /// `effective_k = min(k, len(self))`, `ids` typed `uint64`.
+    #[pyo3(signature = (queries, k, *, nprobe=None, probe_epsilon=None, rescore_k=None))]
+    fn search<'py>(
+        &self,
+        py: Python<'py>,
+        queries: PyReadonlyArray2<f32>,
+        k: usize,
+        nprobe: Option<usize>,
+        probe_epsilon: Option<f32>,
+        rescore_k: Option<usize>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
+        let arr = queries.as_array();
+        let nq = arr.nrows();
+        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        if let Some(idx_dim) = self.inner.dim_opt() {
+            if arr.ncols() != idx_dim {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query dim {} does not match index dim {}",
+                    arr.ncols(),
+                    idx_dim,
+                )));
+            }
+        }
+        if nprobe == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "nprobe must be positive",
+            ));
+        }
+        if let Some(epsilon) = probe_epsilon {
+            if !(epsilon.is_finite() && epsilon >= 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "probe_epsilon must be finite and non-negative",
+                ));
+            }
+        }
+        if matches!(rescore_k, Some(r) if r > 0) && !self.inner.stores_vectors() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rescore_k requires an index built with store_vectors=True",
+            ));
+        }
+
+        // Copy the queries so the scan can run without the GIL (concurrent
+        // Python threads keep working during a long search).
+        let owned_queries = q_slice.to_vec();
+        let index = &self.inner;
+        let (scores, ids) = py.detach(move || {
+            index.search_with_options(
+                &owned_queries,
+                k,
+                turbovec_core::SearchOptions {
+                    nprobe,
+                    probe_epsilon,
+                    rescore_k,
+                },
+            )
+        });
+        let effective_k = if nq == 0 {
+            k.min(self.inner.len())
+        } else {
+            scores.len() / nq
+        };
+
+        let scores_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), scores)
+            .unwrap()
+            .into_pyarray(py);
+        let ids_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), ids)
+            .unwrap()
+            .into_pyarray(py);
+        Ok((scores_arr, ids_arr))
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.inner.contains(id)
+    }
+
+    /// The stored full-precision vectors of the given live ids, as an
+    /// `(len(ids), dim)` float32 array. Requires an index built with
+    /// `store_vectors=True`; raises `KeyError` if any id is not present.
+    fn get_vectors<'py>(
+        &self,
+        py: Python<'py>,
+        ids: PyReadonlyArray1<u64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        if !self.inner.stores_vectors() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "get_vectors requires an index built with store_vectors=True",
+            ));
+        }
+        let ids_arr = ids.as_array();
+        let ids_slice = ids_arr.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
+        let dim = self.inner.dim_opt().unwrap_or(0);
+        let mut out = Vec::with_capacity(ids_slice.len() * dim);
+        for &id in ids_slice {
+            let vector = self.inner.get_vector(id).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "id {id} is not present in the index",
+                ))
+            })?;
+            out.extend_from_slice(&vector);
+        }
+        Ok(
+            numpy::ndarray::Array2::from_shape_vec((ids_slice.len(), dim), out)
+                .unwrap()
+                .into_pyarray(py),
+        )
+    }
+
+    /// Warm the query-side caches (rotation matrix, centroids, delta
+    /// layout). Cheap; does not fault in the mmap-backed codes.
+    fn prepare(&self) {
+        self.inner.prepare();
+    }
+
+    /// Compact to `path`: stream the base segment (minus tombstones) and
+    /// the in-RAM delta into a fresh `.tvdm` file, atomically replace it,
+    /// re-map it as the new base, and empty the delta and tombstones.
+    fn write(&mut self, path: &str) -> PyResult<()> {
+        self.inner
+            .write(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __contains__(&self, id: u64) -> bool {
+        self.inner.contains(id)
+    }
+
+    fn __repr__(&self) -> String {
+        let dim = self
+            .inner
+            .dim_opt()
+            .map_or_else(|| "None".to_string(), |d| d.to_string());
+        format!(
+            "turbovec.DiskIndex(dim={}, bit_width={}, n_vectors={}, base={}, delta={}, tombstones={}, nlist={})",
+            dim,
+            self.inner.bit_width(),
+            self.inner.len(),
+            self.inner.base_len(),
+            self.inner.delta_len(),
+            self.inner.tombstone_count(),
+            self.inner.nlist(),
+        )
+    }
+
+    /// Vector dimensionality. ``None`` until a dim is committed.
+    #[getter]
+    fn dim(&self) -> Option<usize> {
+        self.inner.dim_opt()
+    }
+
+    #[getter]
+    fn bit_width(&self) -> usize {
+        self.inner.bit_width()
+    }
+
+    /// Vectors in the mmap-backed base segment (including tombstoned).
+    #[getter]
+    fn base_len(&self) -> usize {
+        self.inner.base_len()
+    }
+
+    /// Vectors in the in-RAM delta (added since the last `write`).
+    #[getter]
+    fn delta_len(&self) -> usize {
+        self.inner.delta_len()
+    }
+
+    /// Base-segment ids hidden by tombstones (removed since last `write`).
+    #[getter]
+    fn tombstone_count(&self) -> usize {
+        self.inner.tombstone_count()
+    }
+
+    /// Number of partitions in the base segment (1 = flat).
+    #[getter]
+    fn nlist(&self) -> usize {
+        self.inner.nlist()
+    }
+
+    /// Partitioning target, or ``None`` when flat. Settable; takes effect
+    /// at the next `write`.
+    #[getter]
+    fn target_partition_size(&self) -> Option<usize> {
+        self.inner.partition_target()
+    }
+
+    #[setter]
+    fn set_target_partition_size(&mut self, target: Option<usize>) -> PyResult<()> {
+        if target == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target_partition_size must be positive",
+            ));
+        }
+        self.inner.set_partitioning(target);
+        Ok(())
+    }
+
+    /// Boundary multi-assignment epsilon, or ``None`` when off. Settable;
+    /// takes effect at the next `write`.
+    #[getter]
+    fn replica_epsilon(&self) -> Option<f32> {
+        self.inner.replica_epsilon()
+    }
+
+    #[setter]
+    fn set_replica_epsilon(&mut self, epsilon: Option<f32>) -> PyResult<()> {
+        if let Some(e) = epsilon {
+            if !(e.is_finite() && e > 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "replica_epsilon must be finite and positive",
+                ));
+            }
+        }
+        self.inner.set_replication(epsilon);
+        Ok(())
+    }
+
+    /// True if the index keeps full-precision vectors (exact rescoring and
+    /// `get_vectors` available).
+    #[getter]
+    fn store_vectors(&self) -> bool {
+        self.inner.stores_vectors()
+    }
+
+    /// Closure-assignment replica rows in the base segment. Diagnostic.
+    #[getter]
+    fn replica_count(&self) -> usize {
+        self.inner.base_replica_count()
+    }
+
+    /// Backing `.tvdm` file path, or ``None`` before the first write/open.
+    #[getter]
+    fn path(&self) -> Option<String> {
+        self.inner
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+}
+
+impl FreshIndex {
+    fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, turbovec_core::FreshIndex> {
+        self.inner.read().expect("FreshIndex lock poisoned")
+    }
+
+    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, turbovec_core::FreshIndex> {
+        self.inner.write().expect("FreshIndex lock poisoned")
+    }
+}
+#[pyclass]
+struct FreshIndex {
+    /// Behind an RwLock so a query and a maintenance pass overlap.
+    /// pyo3's &self/&mut self rules otherwise make them mutually
+    /// exclusive, and the failure is a Python 'already borrowed'
+    /// exception rather than a wait -- worse than blocking.
+    inner: std::sync::Arc<std::sync::RwLock<turbovec_core::FreshIndex>>,
+    /// The read path does not go through `inner` at all. A reader tracks the
+    /// index's publication cell, so a query loads the current snapshot and
+    /// scans it while a save or maintain pass is midway through building the
+    /// next one. Holding the writer's read lock for the duration of a scan --
+    /// what this used to do -- meant every query still waited out whatever
+    /// bounded chunk of maintenance happened to be running.
+    reader: turbovec_core::FreshReader,
+}
+
+impl FreshIndex {
+    fn wrap(inner: turbovec_core::FreshIndex) -> Self {
+        let reader = inner.reader();
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(inner)),
+            reader,
+        }
+    }
+}
+
+#[pymethods]
+impl FreshIndex {
+    /// Construct an empty incrementally-updatable index with no backing
+    /// directory yet. Vectors live in RAM until the first `save(directory)`,
+    /// which binds the directory, makes the index durable (write-ahead
+    /// log), and appends new vectors to per-partition segment files —
+    /// saves rewrite only the partitions they touch, never the whole index.
+    ///
+    /// Knobs are the same as `DiskIndex`: `target_partition_size` enables
+    /// SPFresh partitioning (with local split/merge/reassign maintenance at
+    /// each save), `store_vectors` keeps full-precision vectors for exact
+    /// rescoring and `get_vectors`, `replica_epsilon` enables boundary
+    /// multi-assignment.
+    /// The maintenance knobs (`reassign_neighbors`, `balanced_split`,
+    /// `resplit_after_reassign`, `replica_prune`) default to the values the
+    /// index has always used; they exist so the choices can be measured on
+    /// this implementation rather than on a reimplementation of it.
+    #[new]
+    #[pyo3(signature = (dim=None, bit_width=4, target_partition_size=None, store_vectors=false, replica_epsilon=None, reassign_neighbors=None, balanced_split=None, resplit_after_reassign=None, replica_prune=None, split_enabled=None, dissolve_enabled=None, reassign_enabled=None, rebootstrap_enabled=None, gc_max_chunks=None, gc_dead_ratio=None, tier_merge_enabled=None, gc_garbage_ratio=None, max_rewrites_per_flush=None, max_reassign_partitions=None, defer_maintenance=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        dim: Option<usize>,
+        bit_width: usize,
+        target_partition_size: Option<usize>,
+        store_vectors: bool,
+        replica_epsilon: Option<f32>,
+        reassign_neighbors: Option<usize>,
+        balanced_split: Option<bool>,
+        resplit_after_reassign: Option<bool>,
+        replica_prune: Option<bool>,
+        split_enabled: Option<bool>,
+        dissolve_enabled: Option<bool>,
+        reassign_enabled: Option<bool>,
+        rebootstrap_enabled: Option<bool>,
+        gc_max_chunks: Option<usize>,
+        gc_dead_ratio: Option<f64>,
+        tier_merge_enabled: Option<bool>,
+        gc_garbage_ratio: Option<f64>,
+        max_rewrites_per_flush: Option<usize>,
+        max_reassign_partitions: Option<usize>,
+        defer_maintenance: Option<bool>,
+    ) -> PyResult<Self> {
+        let mut inner = turbovec_core::FreshIndex::new(dim, bit_width)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        if target_partition_size == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target_partition_size must be positive",
+            ));
+        }
+        if let Some(epsilon) = replica_epsilon {
+            if !(epsilon.is_finite() && epsilon > 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "replica_epsilon must be finite and positive",
+                ));
+            }
+        }
+        if reassign_neighbors == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "reassign_neighbors must be positive",
+            ));
+        }
+        let mut tuning = inner.tuning();
+        if let Some(v) = reassign_neighbors {
+            tuning.reassign_neighbors = v;
+        }
+        if let Some(v) = balanced_split {
+            tuning.balanced_split = v;
+        }
+        if let Some(v) = resplit_after_reassign {
+            tuning.resplit_after_reassign = v;
+        }
+        if let Some(v) = replica_prune {
+            tuning.replica_prune = v;
+        }
+        if let Some(v) = split_enabled {
+            tuning.split_enabled = v;
+        }
+        if let Some(v) = dissolve_enabled {
+            tuning.dissolve_enabled = v;
+        }
+        if let Some(v) = reassign_enabled {
+            tuning.reassign_enabled = v;
+        }
+        if let Some(v) = rebootstrap_enabled {
+            tuning.rebootstrap_enabled = v;
+        }
+        if let Some(v) = gc_max_chunks {
+            tuning.gc_max_chunks = v;
+        }
+        if let Some(v) = tier_merge_enabled {
+            tuning.tier_merge_enabled = v;
+        }
+        if let Some(v) = gc_garbage_ratio {
+            tuning.gc_garbage_ratio = v;
+        }
+        if let Some(v) = gc_dead_ratio {
+            tuning.gc_dead_ratio = v;
+        }
+        if let Some(v) = max_rewrites_per_flush {
+            tuning.max_rewrites_per_flush = v;
+        }
+        if let Some(v) = max_reassign_partitions {
+            tuning.max_reassign_partitions = v;
+        }
+        if let Some(v) = defer_maintenance {
+            tuning.defer_maintenance = v;
+        }
+        inner.set_tuning(tuning);
+        inner.set_partitioning(target_partition_size);
+        inner.set_replication(replica_epsilon);
+        inner.set_store_vectors(store_vectors);
+        Ok(Self::wrap(inner))
+    }
+
+    /// Open an index directory previously produced by `save`. Replays the
+    /// write-ahead log (mutations since the last save survive crashes) and
+    /// cleans up after any interrupted save.
+    #[classmethod]
+    fn open(_cls: &Bound<PyType>, directory: &str) -> PyResult<Self> {
+        let inner = turbovec_core::FreshIndex::open(directory)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+        Ok(Self::wrap(inner))
+    }
+
+    /// Build a FreshIndex directory from a `.tvdm` `DiskIndex` file.
+    /// Lossless: codes, calibration, ids, partitioning, replicas and stored
+    /// vectors carry over unchanged.
+    #[classmethod]
+    fn import_disk_index_file(
+        _cls: &Bound<PyType>,
+        src: &str,
+        directory: &str,
+    ) -> PyResult<Self> {
+        let inner = turbovec_core::FreshIndex::import_disk_index_file(src, directory)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+        Ok(Self::wrap(inner))
+    }
+
+    /// Write the live vectors' codes to a `.tvim` `IdMapIndex` file
+    /// (requires a saved, fully-flushed index).
+    fn export_id_map_file(&self, dst: &str) -> PyResult<()> {
+        self.lock_read()
+            .export_id_map_file(dst)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+    }
+
+    /// Add vectors with external ids (buffered in RAM + write-ahead log;
+    /// appended to partitions at the next `save`).
+    fn add_with_ids(
+        &self,
+        py: Python<'_>,
+        vectors: PyReadonlyArray2<f32>,
+        ids: PyReadonlyArray1<u64>,
+    ) -> PyResult<()> {
+        let v = vectors.as_array();
+        let dim = v.ncols();
+        let v_slice = v.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let i = ids.as_array();
+        let i_slice = i.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
+        // Copy out of numpy first, then drop the GIL for the encode. Holding
+        // it here would block every concurrent query for the whole add, which
+        // is a Python-level stall no amount of lock granularity can fix.
+        let owned_v = v_slice.to_vec();
+        let owned_i = i_slice.to_vec();
+        let inner = std::sync::Arc::clone(&self.inner);
+        py.detach(move || {
+            inner
+                .write()
+                .expect("FreshIndex lock poisoned")
+                .add_with_ids_2d(&owned_v, dim, &owned_i)
+        })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Remove the vector with external id `id`; every stored copy is
+    /// hidden immediately and reclaimed at a later save. Returns `True`
+    /// if the id was present.
+    fn remove(&self, py: Python<'_>, id: u64) -> bool {
+        let inner = std::sync::Arc::clone(&self.inner);
+        py.detach(move || inner.write().expect("FreshIndex lock poisoned").remove(id))
+    }
+
+    /// Remove many ids in one call, syncing the write-ahead log once.
+    ///
+    /// Same durability at the call boundary as `remove` -- everything is on
+    /// disk when this returns -- but one fsync instead of one per id. A loop
+    /// of single `remove` calls spends 88% of its time in fsync.
+    /// Returns how many of the ids were present.
+    fn remove_many(&self, py: Python<'_>, ids: PyReadonlyArray1<u64>) -> PyResult<usize> {
+        let i = ids.as_array();
+        let owned: Vec<u64> = i
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("ids"))?
+            .to_vec();
+        let inner = std::sync::Arc::clone(&self.inner);
+        Ok(py.detach(move || {
+            inner
+                .write()
+                .expect("FreshIndex lock poisoned")
+                .remove_many(&owned)
+        }))
+    }
+
+    /// Search for the top-`k` nearest external ids per query. Knobs as in
+    /// `DiskIndex.search`. Releases the GIL for the scan.
+    #[pyo3(signature = (queries, k, *, nprobe=None, probe_epsilon=None, rescore_k=None))]
+    fn search<'py>(
+        &self,
+        py: Python<'py>,
+        queries: PyReadonlyArray2<f32>,
+        k: usize,
+        nprobe: Option<usize>,
+        probe_epsilon: Option<f32>,
+        rescore_k: Option<usize>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
+        let arr = queries.as_array();
+        let nq = arr.nrows();
+        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        if let Some(idx_dim) = self.reader.dim_opt() {
+            if arr.ncols() != idx_dim {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query dim {} does not match index dim {}",
+                    arr.ncols(),
+                    idx_dim,
+                )));
+            }
+        }
+        if nprobe == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "nprobe must be positive",
+            ));
+        }
+        if let Some(epsilon) = probe_epsilon {
+            if !(epsilon.is_finite() && epsilon >= 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "probe_epsilon must be finite and non-negative",
+                ));
+            }
+        }
+        if matches!(rescore_k, Some(r) if r > 0) && !self.reader.stores_vectors() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rescore_k requires an index built with store_vectors=True",
+            ));
+        }
+
+        let owned_queries = q_slice.to_vec();
+        // The reader is cloned, not the index: no lock on `inner` is taken at
+        // any point, so this cannot wait behind a save or a maintain.
+        let reader = self.reader.clone();
+        let (scores, ids) = py.detach(move || {
+            reader.search_with_options(
+                &owned_queries,
+                k,
+                turbovec_core::SearchOptions {
+                    nprobe,
+                    probe_epsilon,
+                    rescore_k,
+                },
+            )
+        });
+        let effective_k = if nq == 0 {
+            k.min(self.reader.len())
+        } else {
+            scores.len() / nq
+        };
+        let scores_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), scores)
+            .unwrap()
+            .into_pyarray(py);
+        let ids_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), ids)
+            .unwrap()
+            .into_pyarray(py);
+        Ok((scores_arr, ids_arr))
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.reader.contains(id)
+    }
+
+    /// The stored full-precision vectors of the given live ids (requires
+    /// `store_vectors=True`); raises `KeyError` if any id is not present.
+    fn get_vectors<'py>(
+        &self,
+        py: Python<'py>,
+        ids: PyReadonlyArray1<u64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        if !self.reader.stores_vectors() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "get_vectors requires an index built with store_vectors=True",
+            ));
+        }
+        let ids_arr = ids.as_array();
+        let ids_slice = ids_arr.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
+        let dim = self.reader.dim_opt().unwrap_or(0);
+        let mut out = Vec::with_capacity(ids_slice.len() * dim);
+        for &id in ids_slice {
+            let vector = self.reader.get_vector(id).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!(
+                    "id {id} is not present in the index",
+                ))
+            })?;
+            out.extend_from_slice(&vector);
+        }
+        Ok(
+            numpy::ndarray::Array2::from_shape_vec((ids_slice.len(), dim), out)
+                .unwrap()
+                .into_pyarray(py),
+        )
+    }
+
+    fn prepare(&self) {
+        self.reader.prepare();
+    }
+
+    /// Flush to `directory` (bound on first call): buffered vectors are
+    /// appended to their partitions, local maintenance runs, and a new
+    /// manifest is atomically published. Only touched partitions' files
+    /// change — the page cache for the rest stays valid.
+    /// Run one bounded unit of deferred maintenance and publish it.
+    ///
+    /// Takes the write lock only for this bounded chunk, so concurrent
+    /// searches wait at most one chunk rather than a whole pass. Returns True
+    /// while work may remain, so callers can loop until it returns False.
+    fn maintain(&self, py: Python<'_>) -> PyResult<bool> {
+        let inner = std::sync::Arc::clone(&self.inner);
+        py.detach(move || inner.write().expect("FreshIndex lock poisoned").maintain())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+    }
+
+    /// True when some partition is outside the size bound.
+    #[getter]
+    fn needs_maintenance(&self) -> bool {
+        self.lock_read().needs_maintenance()
+    }
+
+    fn save(&self, py: Python<'_>, directory: &str) -> PyResult<()> {
+        let inner = std::sync::Arc::clone(&self.inner);
+        let dir = directory.to_string();
+        py.detach(move || {
+            inner
+                .write()
+                .expect("FreshIndex lock poisoned")
+                .save(&dir)
+        })
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+    }
+
+    fn __len__(&self) -> usize {
+        self.reader.len()
+    }
+
+    fn __contains__(&self, id: u64) -> bool {
+        self.reader.contains(id)
+    }
+
+    fn __repr__(&self) -> String {
+        let dim = self
+            .reader
+            .dim_opt()
+            .map_or_else(|| "None".to_string(), |d| d.to_string());
+        format!(
+            "turbovec.FreshIndex(dim={}, bit_width={}, n_vectors={}, nlist={}, \
+             memtable={}, dead={}, replicas={}, runs={}, chunks={})",
+            dim,
+            self.reader.bit_width(),
+            self.reader.len(),
+            self.reader.nlist(),
+            self.reader.memtable_len(),
+            self.reader.dead_count(),
+            self.reader.replica_count(),
+            self.reader.run_count(),
+            self.reader.chunk_count(),
+        )
+    }
+
+    #[getter]
+    fn dim(&self) -> Option<usize> {
+        self.reader.dim_opt()
+    }
+
+    #[getter]
+    fn bit_width(&self) -> usize {
+        self.reader.bit_width()
+    }
+
+    #[getter]
+    fn nlist(&self) -> usize {
+        self.reader.nlist()
+    }
+
+    #[getter]
+    fn target_partition_size(&self) -> Option<usize> {
+        self.lock_read().partition_target()
+    }
+
+    #[setter]
+    fn set_target_partition_size(&self, target: Option<usize>) -> PyResult<()> {
+        if target == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "target_partition_size must be positive",
+            ));
+        }
+        self.lock_write().set_partitioning(target);
+        Ok(())
+    }
+
+    #[getter]
+    fn replica_epsilon(&self) -> Option<f32> {
+        self.lock_read().replica_epsilon()
+    }
+
+    #[setter]
+    fn set_replica_epsilon(&self, epsilon: Option<f32>) -> PyResult<()> {
+        if let Some(e) = epsilon {
+            if !(e.is_finite() && e > 0.0) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "replica_epsilon must be finite and positive",
+                ));
+            }
+        }
+        self.lock_write().set_replication(epsilon);
+        Ok(())
+    }
+
+    #[getter]
+    fn store_vectors(&self) -> bool {
+        self.reader.stores_vectors()
+    }
+
+    /// Rows buffered in RAM since the last save. Diagnostic.
+    #[getter]
+    fn memtable_len(&self) -> usize {
+        self.reader.memtable_len()
+    }
+
+    /// Dead rows awaiting compaction. Diagnostic.
+    #[getter]
+    fn dead_count(&self) -> usize {
+        self.reader.dead_count()
+    }
+
+    /// Live closure-assignment replica rows. Diagnostic.
+    #[getter]
+    fn replica_count(&self) -> usize {
+        self.reader.replica_count()
+    }
+
+    /// Live primary rows per partition. The mean is pinned near the target
+    /// by construction; the max and upper percentiles are what show whether
+    /// splitting keeps postings balanced. Diagnostic.
+    #[getter]
+    fn partition_sizes(&self) -> Vec<usize> {
+        self.reader.partition_sizes()
+    }
+
+    /// What maintenance actually did, cumulatively — so that "this knob
+    /// changed nothing" can be told apart from "the work this knob governs
+    /// never happened". Diagnostic.
+    #[getter]
+    fn maintenance_stats(&self) -> std::collections::HashMap<String, f64> {
+        let s = self.lock_read().maintenance_stats();
+        [
+            ("splits_attempted", s.splits_attempted as f64),
+            ("splits_done", s.splits_done as f64),
+            ("splits_degenerate", s.splits_degenerate as f64),
+            ("balance_fired", s.balance_fired as f64),
+            ("split_ratio_raw_sum", s.split_ratio_raw_sum),
+            ("split_ratio_final_sum", s.split_ratio_final_sum),
+            ("dissolves", s.dissolves as f64),
+            ("reassign_passes", s.reassign_passes as f64),
+            ("reassign_partitions", s.reassign_partitions as f64),
+            ("reassign_rows_examined", s.reassign_rows_examined as f64),
+            ("reassign_rows_moved", s.reassign_rows_moved as f64),
+            ("resplit_passes", s.resplit_passes as f64),
+            ("rebootstraps", s.rebootstraps as f64),
+            ("compactions", s.compactions as f64),
+            ("us_drain", s.us_drain as f64),
+            ("us_assign", s.us_assign as f64),
+            ("us_append", s.us_append as f64),
+            ("us_maintenance", s.us_maintenance as f64),
+            ("us_publish", s.us_publish as f64),
+            ("us_add_lock", s.us_add_lock as f64),
+            ("us_memtable_scan", s.us_memtable_scan as f64),
+            ("us_decode", s.us_decode as f64),
+            ("us_kmeans_gemm", s.us_kmeans_gemm as f64),
+            ("run_merges", s.run_merges as f64),
+            ("us_run_merge", s.us_run_merge as f64),
+            ("bytes_ingest", s.bytes_ingest as f64),
+            ("bytes_compact", s.bytes_compact as f64),
+            ("bytes_split", s.bytes_split as f64),
+            ("bytes_replica", s.bytes_replica as f64),
+            ("bytes_import", s.bytes_import as f64),
+            ("rows_ingest", s.rows_ingest as f64),
+            ("rows_compact", s.rows_compact as f64),
+            ("rows_split", s.rows_split as f64),
+            ("rows_replica", s.rows_replica as f64),
+            ("chunks_ingest", s.chunks_ingest as f64),
+            ("chunks_compact", s.chunks_compact as f64),
+            ("chunks_split", s.chunks_split as f64),
+            ("chunks_replica", s.chunks_replica as f64),
+            ("bytes_tier", s.bytes_tier as f64),
+            ("rows_tier", s.rows_tier as f64),
+            ("chunks_tier", s.chunks_tier as f64),
+            ("tier_merges", s.tier_merges as f64),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    /// Id-run tables. Diagnostic.
+    #[getter]
+    fn run_count(&self) -> usize {
+        self.reader.run_count()
+    }
+
+    /// Total chunks across all segment files. Diagnostic.
+    #[getter]
+    fn chunk_count(&self) -> usize {
+        self.reader.chunk_count()
+    }
+
+    /// Backing directory, or ``None`` before the first save.
+    #[getter]
+    fn path(&self) -> Option<String> {
+        self.lock_read()
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+}
+
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Pin the 1-thread global sentinel BEFORE anything can touch rayon, so
@@ -2032,6 +2972,8 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_rayon_pool(m.py())?;
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
+    m.add_class::<DiskIndex>()?;
+    m.add_class::<FreshIndex>()?;
     Ok(())
 }
 

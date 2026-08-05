@@ -318,6 +318,68 @@ impl Rotation {
             std::mem::swap(&mut input, &mut output);
         }
     }
+    /// Undo [`Self::apply_with_scratch`]: recover a row from its rotated image.
+    ///
+    /// Upstream never needs this -- it only rotates INTO the encoded space.
+    /// A partitioned index decodes stored codes back to approximate vectors
+    /// for k-means over a partition, split centroids, and reassignment, and
+    /// all of those work in the original coordinate space.
+    ///
+    /// A forward round is `gather-with-sign` then `normalized WHT per block`,
+    /// so the inverse runs the rounds in reverse doing the opposite:
+    ///
+    /// * the normalized Walsh-Hadamard is its own inverse -- the unnormalized
+    ///   butterfly squares to `B * I`, and the `1/sqrt(B)` scale applied twice
+    ///   cancels it, so `H_n * H_n = I`;
+    /// * the fused gather `out[i] = in[perm[i]] * sign[i]` inverts to the
+    ///   scatter `in[perm[i]] = out[i] * sign[i]`, since each sign is +/-1 and
+    ///   so is its own reciprocal.
+    ///
+    /// Exact only to f32 rounding, so the round-trip test asserts a tolerance
+    /// rather than bit equality.
+    pub fn apply_inverse_with_scratch(&self, row: &mut [f32], scratch: &mut [f32]) {
+        assert_eq!(
+            row.len(),
+            self.dim,
+            "rotation input row must have length dim"
+        );
+        assert_eq!(
+            scratch.len(),
+            self.dim,
+            "rotation scratch must have length dim"
+        );
+        let dim = self.dim;
+        let block = self.block;
+
+        const _: () = assert!(K % 2 == 0, "ping-pong ends in `row` only for even K");
+        let (mut input, mut output): (&mut [f32], &mut [f32]) = (row, scratch);
+
+        for round in (0..K).rev() {
+            // Undo the Walsh-Hadamard first: the forward pass applied it
+            // AFTER the gather, so the inverse takes it off before un-permuting.
+            let mut offset = 0;
+            while offset < dim {
+                let blk = &mut input[offset..offset + block];
+                wht_block(blk, block, self.inv_sqrt_block);
+                offset += block;
+            }
+
+            // Undo the fused sign-flip + permutation, as a scatter.
+            let perm = &self.perms[round];
+            let sign_row = &self.signs[round];
+            for i in 0..dim {
+                output[perm[i] as usize] = input[i] * sign_row[i];
+            }
+
+            std::mem::swap(&mut input, &mut output);
+        }
+    }
+
+    /// [`Self::apply_inverse_with_scratch`] with the scratch buffer allocated.
+    pub fn apply_inverse(&self, row: &mut [f32]) {
+        let mut scratch = vec![0.0f32; self.dim];
+        self.apply_inverse_with_scratch(row, &mut scratch);
+    }
 }
 
 /// One permutation round: `dst[i] = src[perm[i]]`, optionally scaled.

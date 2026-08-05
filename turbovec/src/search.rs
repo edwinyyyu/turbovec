@@ -1240,6 +1240,7 @@ unsafe fn neon_block_topk_update(
 
 /// Per-query nibble LUTs for NEON scoring (works for 2-bit and 4-bit).
 
+#[derive(Clone)]
 pub(crate) struct QueryNeonLut {
     pub(crate) uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
     pub(crate) scale: f32,
@@ -1590,31 +1591,47 @@ fn calibrate_queries(
 /// from an index whose parts were validated at construction
 /// ([`from_parts`](crate::TurboQuantIndex::from_parts)); it is not exposed
 /// publicly for that reason.
-pub(crate) fn search(
-    queries: &[f32],    // (nq, dim) row-major
+/// Queries with rotation, TQ+ calibration and LUTs already applied -- the
+/// per-query half of [`search`], reusable across many [`scan`] calls.
+///
+/// A partitioned index scans one query against many separate code regions,
+/// and the LUT depends only on the query. Rebuilding it per region is paid
+/// per REGION, not per query: at nprobe 81 with ~4 chunks each that is ~330
+/// rebuilds of identical work.
+pub struct PreparedQueries {
+    luts: Vec<QueryNeonLut>,
+    nq: usize,
+}
+
+impl PreparedQueries {
+    pub fn nq(&self) -> usize {
+        self.nq
+    }
+
+    /// A handle holding just query `qi`, for when different queries scan
+    /// different regions -- which is what per-query partition routing does.
+    pub fn single(&self, qi: usize) -> PreparedQueries {
+        PreparedQueries {
+            luts: vec![self.luts[qi].clone()],
+            nq: 1,
+        }
+    }
+}
+
+/// Rotation + TQ+ calibration + LUT build. Depends only on the queries, so the
+/// result is valid against any code region sharing `(bits, dim)`.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare(
+    queries: &[f32], // (nq, dim) row-major
     nq: usize,
     rotation: &Rotation,
-    blocked_codes: &[u8],
     centroids: &[f32],
-    vec_scales: &[f32],
-    tqplus_shift: &[f32],     // empty for v2 indexes (identity calibration)
-    tqplus_scale: &[f32],     // empty for v2 indexes (identity calibration)
+    tqplus_shift: &[f32], // empty for v2 indexes (identity calibration)
+    tqplus_scale: &[f32], // empty for v2 indexes (identity calibration)
     bits: usize,
     dim: usize,
-    n_vectors: usize,
-    n_blocks: usize,
-    k: usize,
-    mask: Option<&[u64]>,
-) -> (Vec<f32>, Vec<i64>) {
-    let n_allowed = match mask {
-        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
-        None => n_vectors,
-    };
-    let k = k.min(n_allowed);
-    if k == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let n_byte_groups = dim / (8 / bits);
+) -> PreparedQueries {
+    let _ = bits; // kept for symmetry with `scan`
 
     // Rotate each query row in place with the same deterministic
     // block-Hadamard transform the encode path applies to the database, so
@@ -1650,6 +1667,36 @@ pub(crate) fn search(
         })
         .collect();
 
+    PreparedQueries {
+        luts: query_luts,
+        nq,
+    }
+}
+
+/// Score prepared queries against ONE blocked code region and take top-`k`.
+#[allow(clippy::too_many_arguments)]
+pub fn scan(
+    prepared: &PreparedQueries,
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    bits: usize,
+    dim: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+) -> (Vec<f32>, Vec<i64>) {
+    let nq = prepared.nq;
+    let query_luts = &prepared.luts;
+    let n_allowed = match mask {
+        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
+        None => n_vectors,
+    };
+    let k = k.min(n_allowed);
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let n_byte_groups = dim / (8 / bits);
     // Platform-specific scoring + top-k
     // Single-query fast path (aarch64) — mirror of the x86 version: one
     // query on a large index partitions the block range across pool
@@ -2309,6 +2356,32 @@ pub(crate) fn search(
     }
 
     (all_scores, all_indices)
+}
+
+/// Prepare + scan in one call. Upstream's entry point; behaviour unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search(
+    queries: &[f32], // (nq, dim) row-major
+    nq: usize,
+    rotation: &Rotation,
+    blocked_codes: &[u8],
+    centroids: &[f32],
+    vec_scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    bits: usize,
+    dim: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+) -> (Vec<f32>, Vec<i64>) {
+    let prepared = prepare(
+        queries, nq, rotation, centroids, tqplus_shift, tqplus_scale, bits, dim,
+    );
+    scan(
+        &prepared, blocked_codes, vec_scales, bits, dim, n_vectors, n_blocks, k, mask,
+    )
 }
 
 #[cfg(test)]

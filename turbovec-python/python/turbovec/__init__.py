@@ -1,4 +1,4 @@
-from ._turbovec import IdMapIndex, TurboQuantIndex
+from ._turbovec import DiskIndex, FreshIndex, IdMapIndex, TurboQuantIndex
 
 #: Default batch slice size for the interruptible-chunking wrappers over
 #: ``search`` / ``add`` / ``add_with_ids`` (issue #216). Batches with more
@@ -21,7 +21,14 @@ from . import _interruptible as _interruptible  # noqa: E402
 
 _interruptible.install()
 
-__all__ = ["BATCH_CHUNK_SIZE", "IdMapIndex", "TurboQuantIndex", "__version__"]
+__all__ = [
+    "BATCH_CHUNK_SIZE",
+    "DiskIndex",
+    "FreshIndex",
+    "IdMapIndex",
+    "TurboQuantIndex",
+    "__version__",
+]
 
 
 def __getattr__(name: str) -> str:

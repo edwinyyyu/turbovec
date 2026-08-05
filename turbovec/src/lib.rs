@@ -71,6 +71,18 @@ pub mod rotation;
 pub mod search;
 pub mod warning;
 
+// The partitioned incremental index and its supporting modules. Upstream
+// supplies the encoder, scan kernel, codebook, packing and IdMapIndex; these
+// add IVF+LIRE on top.
+pub mod decode;
+pub mod disk;
+pub mod fresh;
+pub mod kmeans;
+pub mod linalg;
+
+pub use disk::{DiskIndex, SearchOptions};
+pub use fresh::{FreshIndex, FreshReader, Snapshot};
+
 // Kernel-level correctness tests that exercise the crate-internal leaves
 // (`codebook`, `encode`, `pack`). These moved in-crate when those functions
 // became `pub(crate)` (they trust caller invariants and are no longer part

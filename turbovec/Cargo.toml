@@ -34,6 +34,7 @@ keywords = ["vector-search", "quantization", "nearest-neighbor", "ann", "simd"]
 categories = ["algorithms", "science", "compression"]
 
 [dependencies]
+memmap2 = "0.9"
 # Kept in lockstep with turbovec-python's floor so both crates resolve to a
 # single rayon-core (see that crate's rayon note and issue #147).
 rayon = "1.12"
@@ -71,6 +72,7 @@ statrs = "=0.17.1"
 mask-skip-counter = []
 
 [dev-dependencies]
+rand_distr = "0.4"   # matches upstream rand 0.8
 # Self dev-dependency so `cargo test` still exercises the block-skip
 # activation test without the counter existing in release builds.
 turbovec = { path = ".", features = ["mask-skip-counter"] }

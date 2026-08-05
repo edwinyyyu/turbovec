@@ -948,3 +948,178 @@ mod seq_lane_tests {
         }
     }
 }
+
+
+// Helpers for the chunked partition format: the index stores rows as
+// per-vector group bytes and packs whole chunks at a time.
+/// Number of group bytes per vector in the SIMD-blocked layout.
+pub(crate) fn n_byte_groups(bits: usize, dim: usize) -> usize {
+    dim / (8 / bits)
+}
+
+/// Extract per-vector "group bytes" — the nibble-packed bytes the SIMD
+/// scoring kernel consumes — from bit-plane packed codes. Returns a flat
+/// row-major array of `n_vectors * n_byte_groups(bits, dim)` bytes.
+pub(crate) fn group_bytes(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+) -> Vec<u8> {
+    let bytes_per_plane = dim / 8;
+    let codes_per_byte = 8 / bits;
+    let n_byte_groups = n_byte_groups(bits, dim);
+    let bytes_per_row = bits * bytes_per_plane;
+
+    let mut rows = vec![0u8; n_vectors * n_byte_groups];
+    for vec_idx in 0..n_vectors {
+        for g in 0..n_byte_groups {
+            let dim_start = g * codes_per_byte;
+            let mut byte_val = 0u8;
+            for c in 0..codes_per_byte {
+                let j = dim_start + c;
+                let byte_in_plane = j / 8;
+                let bit_in_byte = 7 - (j % 8);
+                let mask = 1u8 << bit_in_byte;
+
+                let mut code = 0u8;
+                for p in 0..bits {
+                    let plane_byte =
+                        packed_codes[vec_idx * bytes_per_row + p * bytes_per_plane + byte_in_plane];
+                    if plane_byte & mask != 0 {
+                        code |= 1 << p;
+                    }
+                }
+
+                let shift = if bits == 3 {
+                    (codes_per_byte - 1 - c) * 4
+                } else {
+                    (codes_per_byte - 1 - c) * bits
+                };
+                byte_val |= code << shift;
+            }
+            rows[vec_idx * n_byte_groups + g] = byte_val;
+        }
+    }
+    rows
+}
+
+/// Inverse of [`group_bytes`]: reconstruct bit-plane packed codes from
+/// per-vector group-byte rows. `rows` is `n_vectors * n_byte_groups(bits,
+/// dim)` bytes; returns `n_vectors * dim * bits / 8` bit-plane bytes.
+pub(crate) fn packed_from_group_bytes(
+    rows: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+) -> Vec<u8> {
+    let bytes_per_plane = dim / 8;
+    let codes_per_byte = 8 / bits;
+    let n_byte_groups = n_byte_groups(bits, dim);
+    let bytes_per_row = bits * bytes_per_plane;
+    assert_eq!(rows.len(), n_vectors * n_byte_groups);
+
+    let mut packed = vec![0u8; n_vectors * bytes_per_row];
+    for vec_idx in 0..n_vectors {
+        for g in 0..n_byte_groups {
+            let byte_val = rows[vec_idx * n_byte_groups + g];
+            let dim_start = g * codes_per_byte;
+            for c in 0..codes_per_byte {
+                let shift = if bits == 3 {
+                    (codes_per_byte - 1 - c) * 4
+                } else {
+                    (codes_per_byte - 1 - c) * bits
+                };
+                let code = (byte_val >> shift) & ((1u8 << bits) - 1);
+
+                let j = dim_start + c;
+                let byte_in_plane = j / 8;
+                let bit_in_byte = 7 - (j % 8);
+                let mask = 1u8 << bit_in_byte;
+                for p in 0..bits {
+                    if code & (1 << p) != 0 {
+                        packed[vec_idx * bytes_per_row + p * bytes_per_plane + byte_in_plane] |=
+                            mask;
+                    }
+                }
+            }
+        }
+    }
+    packed
+}
+
+/// `rows` is `n_rows * n_byte_groups` bytes (`n_rows <= BLOCK`); `out` must
+/// be `n_byte_groups * BLOCK` bytes and is fully overwritten (missing lanes
+/// pack as zero, matching the original repack padding).
+pub(crate) fn pack_block_rows(rows: &[u8], n_rows: usize, n_byte_groups: usize, out: &mut [u8]) {
+    assert!(n_rows <= BLOCK);
+    assert_eq!(rows.len(), n_rows * n_byte_groups);
+    assert_eq!(out.len(), n_byte_groups * BLOCK);
+
+    let row = |lane: usize, g: usize| -> u8 {
+        if lane < n_rows {
+            rows[lane * n_byte_groups + g]
+        } else {
+            0
+        }
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // FAISS layout: split each byte into hi/lo nibbles, interleave with PERM0.
+        for g in 0..n_byte_groups {
+            let out_offset = g * BLOCK;
+            for j in 0..16 {
+                let ba = row(PERM0[j], g);
+                let bb = row(PERM0[j] + 16, g);
+                out[out_offset + j] = (ba >> 4) | ((bb >> 4) << 4);
+                out[out_offset + 16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // Sequential layout: each byte stored as-is, vectors in order.
+        for g in 0..n_byte_groups {
+            let out_offset = g * BLOCK;
+            for (lane, out_byte) in out[out_offset..out_offset + BLOCK].iter_mut().enumerate() {
+                *out_byte = row(lane, g);
+            }
+        }
+    }
+}
+
+/// Inverse of [`pack_block_rows`]: extract the [`BLOCK`] row-major
+/// group-byte rows from one blocked block. `block` is
+/// `n_byte_groups * BLOCK` bytes; `out` must be `BLOCK * n_byte_groups`
+/// bytes and is fully overwritten (padding lanes come back as zero rows).
+pub(crate) fn unpack_block_rows(block: &[u8], n_byte_groups: usize, out: &mut [u8]) {
+    assert_eq!(block.len(), n_byte_groups * BLOCK);
+    assert_eq!(out.len(), BLOCK * n_byte_groups);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        for g in 0..n_byte_groups {
+            let in_offset = g * BLOCK;
+            for j in 0..16 {
+                let hi = block[in_offset + j];
+                let lo = block[in_offset + 16 + j];
+                let ba = ((hi & 0x0F) << 4) | (lo & 0x0F);
+                let bb = (hi & 0xF0) | (lo >> 4);
+                out[PERM0[j] * n_byte_groups + g] = ba;
+                out[(PERM0[j] + 16) * n_byte_groups + g] = bb;
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        for g in 0..n_byte_groups {
+            let in_offset = g * BLOCK;
+            for lane in 0..BLOCK {
+                out[lane * n_byte_groups + g] = block[in_offset + lane];
+            }
+        }
+    }
+}
