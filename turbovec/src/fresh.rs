@@ -382,6 +382,27 @@ pub struct MaintenanceTuning {
     /// never fires and every incremental write accumulates -- which is what
     /// makes reassignment look expensive on the latency axis.
     pub gc_max_chunks: usize,
+    /// Hold arrivals in the memtable across saves until it reaches this many
+    /// rows, then distribute them to partitions in one pass. 0 drains every
+    /// save (the original behaviour).
+    ///
+    /// This is the staging tier, and it needs no new storage: the memtable is
+    /// already durable (every `add` appends to the WAL and syncs, and the log
+    /// replays on open) and already scanned by every query. Staging is
+    /// therefore a gate on the DRAIN, not a new subsystem.
+    ///
+    /// It exists because distribution cost is dominated by how many rows each
+    /// partition receives at once. A 10k batch over 810 partitions writes
+    /// ~12-row chunks, and a chunk pads its codes to a whole 32-row block, so
+    /// most of what is written is padding. Measured over +200k rows at
+    /// deep 1.6M, raising the distribution size moves segment amplification
+    /// 21.1x (5k) -> 11.1x (10k) -> 4.8x (50k) -> 3.4x (200k), with the knee
+    /// around 50-100k.
+    ///
+    /// The cost is query-side: a staged row is found by scanning the memtable,
+    /// which at 768d runs at ~0.64 ms per 50k rows, so a 100k staging tier
+    /// adds ~1.3 ms to every query. Bound it accordingly.
+    pub staging_threshold: usize,
     /// Fold trailing small chunks by appending a merged chunk instead of
     /// rewriting the partition (`tier_merge`). Off reproduces the pre-fix
     /// compaction behaviour, which is the only reason the flag exists.
@@ -451,6 +472,7 @@ impl Default for MaintenanceTuning {
             // 13812 -> 397 for +5% maintenance time, and it is what lets
             // reassignment's quality gain reach the latency axis at all.
             gc_max_chunks: 4,
+            staging_threshold: 0,
             tier_merge_enabled: true,
             gc_garbage_ratio: 0.5,
             max_rewrites_per_flush: 0,
@@ -551,6 +573,9 @@ pub struct MaintenanceStats {
     pub chunks_tier: u64,
     /// Times `tier_merge` folded a run of trailing chunks.
     pub tier_merges: u64,
+    /// Saves that published without draining the memtable, because staging
+    /// had not filled. The rows stayed in the WAL and the memtable.
+    pub staged_saves: u64,
 }
 
 /// Why a chunk is being written. Attribution only -- it does not change what
@@ -1989,9 +2014,25 @@ impl FreshIndex {
         let mut entries: Vec<RunEntry> = Vec::new();
         let mut dropped_files: Vec<PathBuf> = Vec::new();
 
-        // Drain the memtable into per-partition appends.
+        // Drain the memtable into per-partition appends -- unless staging is
+        // on and the memtable has not filled yet, in which case the rows stay
+        // put and this save only publishes.
+        //
+        // Skipping the drain means the WAL must NOT be reset below: the rows
+        // it holds are still the only durable copy. That coupling is the whole
+        // correctness argument for staging, so both branches key off this one
+        // flag rather than recomputing the condition.
+        let staged = self.memtable_len();
+        let draining = self.tuning.staging_threshold == 0 || staged >= self.tuning.staging_threshold;
+        if !draining {
+            self.stats.staged_saves += 1;
+        }
         let t_drain = std::time::Instant::now();
-        let batch = self.drain_memtable(dim);
+        let batch = if draining {
+            self.drain_memtable(dim)
+        } else {
+            RowBatch::default()
+        };
         self.stats.us_drain = t_drain.elapsed().as_micros() as u64;
         if batch.n > 0 {
             if self.state.partitions.is_empty() {
@@ -2029,13 +2070,34 @@ impl FreshIndex {
             self.merge_runs(&mut dropped_files)?;
         }
         self.sync_pending()?;
-        self.epoch += 1;
+        // The epoch is the WAL generation counter (plus seed entropy for
+        // splits): `replay_or_reset_wal` replays a log only when its recorded
+        // epoch matches the manifest's, on the reasoning that a stale log's
+        // records are already in the manifest state.
+        //
+        // A staging save breaks that reasoning -- its records are NOT in the
+        // manifest -- so it must not advance the epoch. Bumping it here while
+        // leaving the WAL alone makes the log look stale and silently discards
+        // every staged row at the next open.
+        //
+        // Both orders are crash-safe with this in place. Crash during a
+        // staging save: manifest and WAL both at E, so the log replays. Crash
+        // during a draining save between the manifest and `reset_wal`:
+        // manifest at E+1, WAL at E, so the log is discarded -- correctly,
+        // because its rows are in the segments the manifest now names.
+        if draining {
+            self.epoch += 1;
+        }
         self.write_manifest()?;
-        self.reset_wal()?;
+        if draining {
+            self.reset_wal()?;
+        }
         // A FRESH cell, not a cleared one: readers still on the previous
         // snapshot keep the old cell and every row it holds, while readers on
         // the new snapshot find those rows in the partitions instead.
-        self.state.memtable = MemtableCell::new(self.fresh_memtable(dim)?);
+        if draining {
+            self.state.memtable = MemtableCell::new(self.fresh_memtable(dim)?);
+        }
         // Only here does the flush become visible: readers ran the whole
         // drain/append/maintenance against the previous snapshot.
         self.publish_with(dropped_files);
