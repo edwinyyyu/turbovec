@@ -587,6 +587,12 @@ pub struct MaintenanceStats {
     /// Saves that published without draining the memtable, because staging
     /// had not filled. The rows stayed in the WAL and the memtable.
     pub staged_saves: u64,
+    /// The ingest assign phase, split. `us_kmeans_gemm` and `us_decode` are
+    /// GLOBAL counters that maintenance also increments, so attributing them
+    /// to ingest overstates it -- these two are written only from the ingest
+    /// assign path and are per-flush gauges like the rest.
+    pub us_assign_decode: u64,
+    pub us_assign_gemm: u64,
 }
 
 /// Why a chunk is being written. Attribution only -- it does not change what
@@ -2046,6 +2052,8 @@ impl FreshIndex {
         self.stats.us_append = 0;
         self.stats.us_maintenance = 0;
         self.stats.us_publish = 0;
+        self.stats.us_assign_decode = 0;
+        self.stats.us_assign_gemm = 0;
 
         let mut entries: Vec<RunEntry> = Vec::new();
         let mut dropped_files: Vec<PathBuf> = Vec::new();
@@ -2228,13 +2236,17 @@ impl FreshIndex {
     /// of which the allocation floor is the part that does not scale with
     /// nlist). Replication is off in the recommended design, so the common
     /// path does not need the nesting.
-    fn assign_batch_single(&self, batch: &RowBatch, dim: usize) -> Vec<u32> {
+    fn assign_batch_single(&mut self, batch: &RowBatch, dim: usize) -> Vec<u32> {
         let nlist = self.state.partitions.len();
         if !self.state.clustered || nlist <= 1 {
             return vec![0u32; batch.n];
         }
+        let t_dec = std::time::Instant::now();
         let vectors = self.batch_vectors(batch, dim);
+        self.stats.us_assign_decode = t_dec.elapsed().as_micros() as u64;
+        let t_gemm = std::time::Instant::now();
         let (assignments, _) = kmeans::assign(&vectors, batch.n, dim, &self.state.centroids, nlist);
+        self.stats.us_assign_gemm = t_gemm.elapsed().as_micros() as u64;
         assignments
     }
 

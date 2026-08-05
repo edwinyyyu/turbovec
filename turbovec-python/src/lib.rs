@@ -2938,6 +2938,8 @@ impl FreshIndex {
             ("chunks_tier", s.chunks_tier as f64),
             ("tier_merges", s.tier_merges as f64),
             ("staged_saves", s.staged_saves as f64),
+            ("us_assign_decode", s.us_assign_decode as f64),
+            ("us_assign_gemm", s.us_assign_gemm as f64),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
