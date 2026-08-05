@@ -80,17 +80,28 @@ const MANIFEST_MAGIC: &[u8; 4] = b"TVFM";
 const WAL_MAGIC: &[u8; 4] = b"TVFW";
 const RUN_MAGIC: &[u8; 4] = b"TVFR";
 const CHUNK_MAGIC: &[u8; 4] = b"TVFC";
+// v3 moves the centroid blob out of the manifest into `centroids-<gen>`,
+// referenced by generation. The manifest is rewritten every save and carries
+// `nlist * dim * 4` bytes of centroids; measured, 73% of those saves change no
+// centroid at all, and at 10M x 768d the blob is ~30 MB against ~4 MB of new
+// row data. Splitting it makes the per-save manifest O(partitions + N/8)
+// instead of O(nlist * dim).
+//
 // v2 adds `file_bytes` per partition to the manifest. A tier merge
 // appends the merged chunk and abandons the originals in place, so the
 // physical end of file no longer follows from the chunk table and has to
 // be recorded. No v1 reader can locate the append point in a v2 file, so
 // this is a breaking bump rather than an optional trailer.
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const FLAG_HAS_VECTORS: u8 = 1;
 const FLAG_CLUSTERED: u8 = 2;
 
 const MANIFEST_FILE: &str = "manifest";
 const MANIFEST_TEMP_FILE: &str = "manifest.tmp";
+/// Centroids live beside the manifest, not inside it, and are rewritten only
+/// when they change. Named by generation so a reader's manifest always points
+/// at the blob it was written against.
+const CENTROIDS_PREFIX: &str = "centroids-";
 const WAL_FILE: &str = "wal";
 
 /// Section alignment inside segment files; also the chunk header size.
@@ -602,6 +613,10 @@ pub(crate) enum WriteReason {
 /// -- so this only fires if merging is somehow not keeping up, and exists so a
 /// bug there degrades to the old behaviour instead of unbounded chunk growth.
 const TIER_MERGE_CHUNK_BACKSTOP: usize = 24;
+
+/// Run-count ceiling that still forces an all-runs merge. Tiering holds the
+/// count at O(log entries); this only fires if it is not keeping up.
+const RUN_TIER_BACKSTOP: usize = 24;
 
 /// Largest tolerated size ratio between the two children of a split.
 const SPLIT_BALANCE_RATIO: f32 = 1.5;
@@ -1436,6 +1451,13 @@ pub struct FreshIndex {
     stats: MaintenanceStats,
     partition_target: Option<usize>,
     epoch: u64,
+    /// Generation of the on-disk centroid blob the manifest references, and
+    /// whether the in-memory centroids have diverged from it since.
+    centroids_generation: u64,
+    centroids_dirty: bool,
+    /// Previous centroid blob, unlinked once the manifest naming its
+    /// replacement has been renamed into place.
+    retired_centroids: Option<PathBuf>,
     next_partition_id: u32,
     next_run_generation: u64,
     churn_since_check: u64,
@@ -1498,6 +1520,9 @@ impl FreshIndex {
             stats: MaintenanceStats::default(),
             partition_target: None,
             epoch: 0,
+            centroids_generation: 0,
+            centroids_dirty: true,
+            retired_centroids: None,
             next_partition_id: 0,
             next_run_generation: 0,
             churn_since_check: 0,
@@ -1727,7 +1752,7 @@ impl FreshIndex {
             self.write_run(&entries)?;
         }
         if self.state.runs.len() > MAX_RUNS {
-            self.merge_runs(&mut dropped_files)?;
+            self.tier_merge_runs(&mut dropped_files)?;
         }
         self.sync_pending()?;
         self.epoch += 1;
@@ -2011,6 +2036,17 @@ impl FreshIndex {
         };
         self.commit_calibration(dim);
 
+        // Phase timers are GAUGES for this flush, and each is written only on
+        // the path that runs it. A staging save skips the drain entirely, so
+        // without this reset `us_assign`/`us_append` keep the last DRAINING
+        // flush's values and a caller summing them across saves counts that
+        // drain once per save. Zero them up front so "did not run" reads as 0.
+        self.stats.us_drain = 0;
+        self.stats.us_assign = 0;
+        self.stats.us_append = 0;
+        self.stats.us_maintenance = 0;
+        self.stats.us_publish = 0;
+
         let mut entries: Vec<RunEntry> = Vec::new();
         let mut dropped_files: Vec<PathBuf> = Vec::new();
 
@@ -2067,7 +2103,7 @@ impl FreshIndex {
             self.write_run(&entries)?;
         }
         if self.state.runs.len() > MAX_RUNS {
-            self.merge_runs(&mut dropped_files)?;
+            self.tier_merge_runs(&mut dropped_files)?;
         }
         self.sync_pending()?;
         // The epoch is the WAL generation counter (plus seed entropy for
@@ -2877,7 +2913,7 @@ impl FreshIndex {
                 }
             }
             let centroid =
-                &mut Arc::make_mut(&mut self.state.centroids)[position * dim..(position + 1) * dim];
+                &mut self.centroids_mut()[position * dim..(position + 1) * dim];
             for (c, &m) in centroid.iter_mut().zip(&mean) {
                 *c = (m / live.n as f64) as f32;
             }
@@ -3309,6 +3345,7 @@ impl FreshIndex {
             self.drop_partition(0, dim, dropped_files);
         }
         self.state.centroids = Arc::new(Vec::new());
+        self.centroids_dirty = true;
         for c in 0..nlist {
             self.create_partition(&centroids[c * dim..(c + 1) * dim], entries)?;
         }
@@ -3333,6 +3370,15 @@ impl FreshIndex {
     // Partition bookkeeping
     // ------------------------------------------------------------------
 
+    /// Mutable centroids. Every mutation goes through here so the dirty flag
+    /// cannot be missed -- a missed flag means the manifest keeps pointing at
+    /// a stale blob and the index silently routes against old centroids after
+    /// a reload.
+    fn centroids_mut(&mut self) -> &mut Vec<f32> {
+        self.centroids_dirty = true;
+        Arc::make_mut(&mut self.state.centroids)
+    }
+
     fn create_partition(
         &mut self,
         centroid: &[f32],
@@ -3350,7 +3396,7 @@ impl FreshIndex {
             dead: Vec::new(),
             file_bytes: 0,
         }));
-        Arc::make_mut(&mut self.state.centroids).extend_from_slice(centroid);
+        self.centroids_mut().extend_from_slice(centroid);
         Ok(self.state.partitions.len() - 1)
     }
 
@@ -3364,7 +3410,7 @@ impl FreshIndex {
             ));
         }
         self.invalidate_segment_map(partition.partition_id);
-        Arc::make_mut(&mut self.state.centroids).drain(position * dim..(position + 1) * dim);
+        self.centroids_mut().drain(position * dim..(position + 1) * dim);
     }
 
     /// Append `rows` to `position`'s segment file as one chunk, fsync, and
@@ -3601,6 +3647,23 @@ impl FreshIndex {
     }
 
     fn merge_runs_inner(&mut self, dropped_files: &mut Vec<PathBuf>) -> io::Result<()> {
+        let n = self.state.runs.len();
+        self.merge_run_range(0, n, dropped_files)
+    }
+
+    /// Merge runs `[from, to)` into one, preserving their position in the
+    /// newest-first lookup order.
+    ///
+    /// Lookup scans runs newest-first and takes the first hit, so a newer run
+    /// shadows an older one for the same id. Merging a CONTIGUOUS range keeps
+    /// that: within the range the same newest-first walk decides which entry
+    /// survives, and the result sits where the range was.
+    fn merge_run_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        dropped_files: &mut Vec<PathBuf>,
+    ) -> io::Result<()> {
         let directory = self
             .state
             .directory
@@ -3609,7 +3672,9 @@ impl FreshIndex {
             .to_path_buf();
         let mut merged: Vec<RunEntry> = Vec::new();
         let mut seen: HashSet<(u32, u32)> = HashSet::new();
-        for &generation in self.state.runs.iter().rev() {
+        let range: Vec<u64> = self.state.runs[from..to].to_vec();
+        let tail: Vec<u64> = self.state.runs[to..].to_vec();
+        for &generation in range.iter().rev() {
             let map = self.run_map(generation)?;
             let count = run_entry_count(&map);
             for idx in 0..count {
@@ -3629,17 +3694,67 @@ impl FreshIndex {
                 }
             }
         }
-        for &generation in self.state.runs.iter() {
+        for &generation in range.iter() {
             dropped_files.push(run_path(&directory, generation));
         }
-        Arc::make_mut(&mut self.state.runs).clear();
+        Arc::make_mut(&mut self.state.runs).truncate(from);
         self.state
             .caches
             .run_maps
             .lock()
             .expect("run map lock")
             .clear();
-        self.write_run(&merged)
+        self.write_run(&merged)?;
+        // Runs newer than the merged range keep their order after it.
+        Arc::make_mut(&mut self.state.runs).extend_from_slice(&tail);
+        Ok(())
+    }
+
+    /// Merge runs in size tiers instead of collapsing all of them.
+    ///
+    /// The all-runs merge rewrites every live entry, so its cost is O(N) and
+    /// it fires every `MAX_RUNS` saves -- measured as the largest single term
+    /// in `publish`, which grew 16x over an 8.2x rise in nlist while every
+    /// other phase grew sublinearly.
+    ///
+    /// The same carry rule `tier_merge` uses for chunks applies here: merge
+    /// the newest run of runs while it is at least as large as the run before
+    /// it. Sizes then decrease from the front, so an entry is rewritten
+    /// O(log n) times rather than once per merge cycle, and the large oldest
+    /// run is only touched by a merge that has already accumulated as many
+    /// entries as it holds.
+    fn tier_merge_runs(&mut self, dropped_files: &mut Vec<PathBuf>) -> io::Result<()> {
+        loop {
+            let n = self.state.runs.len();
+            if n < 2 {
+                break;
+            }
+            let mut sizes = Vec::with_capacity(n);
+            for &generation in self.state.runs.iter() {
+                let map = self.run_map(generation)?;
+                sizes.push(run_entry_count(&map) as u64);
+            }
+            let mut from = n - 1;
+            let mut acc = sizes[from];
+            while from > 0 && acc >= sizes[from - 1] {
+                from -= 1;
+                acc += sizes[from];
+            }
+            if from == n - 1 {
+                break; // newest run is smaller than its predecessor
+            }
+            self.stats.run_merges += 1;
+            let t = std::time::Instant::now();
+            self.merge_run_range(from, n, dropped_files)?;
+            self.stats.us_run_merge += t.elapsed().as_micros() as u64;
+        }
+        // Backstop: tiering bounds the count logarithmically, so this only
+        // fires if that is somehow not keeping up, and degrades to the old
+        // behaviour rather than letting lookup walk an unbounded list.
+        if self.state.runs.len() > RUN_TIER_BACKSTOP {
+            self.merge_runs(dropped_files)?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -3796,7 +3911,7 @@ impl FreshIndex {
     // Manifest
     // ------------------------------------------------------------------
 
-    fn write_manifest(&self) -> io::Result<()> {
+    fn write_manifest(&mut self) -> io::Result<()> {
         let directory = self
             .state
             .directory
@@ -3850,7 +3965,37 @@ impl FreshIndex {
             debug_assert_eq!(bitmap_len, partition.dead.len());
             out.extend_from_slice(&partition.dead);
         }
-        out.extend_from_slice(f32_bytes(&self.state.centroids));
+        // Centroids by reference, not by value. Rewriting them costs
+        // `nlist * dim * 4` on every save -- ~30 MB at 10M x 768d -- and 73%
+        // of saves change none of them.
+        let stale = directory.join(format!(
+            "{}{:016}",
+            CENTROIDS_PREFIX, self.centroids_generation
+        ));
+        if self.centroids_dirty || !stale.exists() {
+            // A NEW generation, never an overwrite: the old manifest still
+            // names the old generation until the rename below lands, and
+            // rewriting that file in place would change what an unreplaced
+            // manifest resolves to.
+            self.centroids_generation += 1;
+            let path = directory.join(format!(
+                "{}{:016}",
+                CENTROIDS_PREFIX, self.centroids_generation
+            ));
+            // Durable BEFORE the manifest rename that names it, so a manifest
+            // never references a blob that is not on disk.
+            let temp = directory.join(format!("{}tmp", CENTROIDS_PREFIX));
+            let mut file = File::create(&temp)?;
+            file.write_all(f32_bytes(&self.state.centroids))?;
+            full_sync(&file)?;
+            fs::rename(&temp, &path)?;
+            self.centroids_dirty = false;
+            // The superseded blob is retired only after the manifest rename
+            // publishes its replacement; an orphan left by a crash in between
+            // is swept at the next open.
+            self.retired_centroids = Some(stale);
+        }
+        out.extend_from_slice(&self.centroids_generation.to_le_bytes());
         let crc = crc32(&out);
         out.extend_from_slice(&crc.to_le_bytes());
 
@@ -3867,6 +4012,9 @@ impl FreshIndex {
         fs::rename(&temp_path, directory.join(MANIFEST_FILE))?;
         let dir_handle = File::open(directory)?;
         full_sync(&dir_handle)?;
+        if let Some(stale) = self.retired_centroids.take() {
+            fs::remove_file(stale).ok();
+        }
         Ok(())
     }
 
@@ -3946,7 +4094,31 @@ impl FreshIndex {
                 file_bytes,
             });
         }
-        let centroids = cursor.f32s(n_partitions * dim)?;
+        let centroids_generation = cursor.u64()?;
+        let centroids = {
+            let path = directory.join(format!(
+                "{}{:016}",
+                CENTROIDS_PREFIX, centroids_generation
+            ));
+            let bytes = fs::read(&path).map_err(|e| {
+                invalid_data(format!(
+                    "manifest references {} which cannot be read: {e}",
+                    path.display(),
+                ))
+            })?;
+            let want = n_partitions * dim * 4;
+            if bytes.len() != want {
+                return Err(invalid_data(format!(
+                    "centroid blob {} is {} bytes, expected {want}",
+                    path.display(),
+                    bytes.len(),
+                )));
+            }
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>()
+        };
 
         let memtable = if dim > 0 {
             if n_calib > 0 {
@@ -3995,6 +4167,14 @@ impl FreshIndex {
         // so a reopened index starts from the defaults.
         index.partition_target = if target > 0 { Some(target) } else { None };
         index.epoch = epoch;
+        // Restore which centroid blob this manifest names, and mark it clean:
+        // the in-memory centroids came FROM that blob, so nothing has diverged
+        // yet. Leaving the generation at its constructor default makes the
+        // orphan sweep delete the very file the manifest references -- and it
+        // does so on the SECOND open, because the first still reads the
+        // manifest before sweeping.
+        index.centroids_generation = centroids_generation;
+        index.centroids_dirty = false;
         index.next_partition_id = next_partition_id;
         index.next_run_generation = next_run_generation;
         index.churn_since_check = churn_since_check;
@@ -4024,6 +4204,13 @@ impl FreshIndex {
             let name = name.to_string_lossy();
             if name == MANIFEST_FILE || name == WAL_FILE {
                 continue;
+            }
+            if let Some(rest) = name.strip_prefix(CENTROIDS_PREFIX) {
+                // Keep the generation the manifest names; every other blob is
+                // a superseded one, or an orphan from a crash mid-write.
+                if rest.parse::<u64>() == Ok(self.centroids_generation) {
+                    continue;
+                }
             }
             if let Some(rest) = name.strip_prefix("segment-") {
                 let mut parts = rest.splitn(2, '-');
