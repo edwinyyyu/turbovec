@@ -38,7 +38,7 @@ fn flat_vs_hierarchy_at_build_shapes() {
         // The rebuild is charged to the same gauge as the assignment it
         // accelerates, so it has to be separated or it reads as a slow assign.
         let t = std::time::Instant::now();
-        let coarse = CoarseIndex::build(&centroids, nlist, dim, 7);
+        let coarse = CoarseIndex::build(&centroids, nlist, dim, probe, 7);
         println!("  build(nlist={nlist}) = {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         for &n in &[10_000usize, 20_000] {
             let data = unit_rows(n, dim, 0xBEEF ^ n as u64);

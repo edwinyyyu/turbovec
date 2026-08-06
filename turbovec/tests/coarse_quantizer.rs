@@ -38,7 +38,7 @@ fn hierarchical_assignment_agrees_with_the_flat_scan() {
         let rows = corpus(n_rows, dim, 99);
 
         let exact = km::assign_flat(&rows, n_rows, dim, &centroids, nlist);
-        let coarse = km::CoarseIndex::build(&centroids, nlist, dim, 42);
+        let coarse = km::CoarseIndex::build(&centroids, nlist, dim, 8, 42);
         for &probe in &[1usize, 2, 4, 8] {
             let got = coarse.assign(&rows, n_rows, &centroids, probe);
             for (i, &c) in got.iter().enumerate() {
@@ -93,7 +93,7 @@ fn hierarchical_assignment_actually_prunes() {
     let dim = 64;
     for &nlist in &[1024usize, 4096, 16384] {
         let centroids = corpus(nlist, dim, 7);
-        let coarse = km::CoarseIndex::build(&centroids, nlist, dim, 42);
+        let coarse = km::CoarseIndex::build(&centroids, nlist, dim, 8, 42);
         let counts = coarse.member_counts();
         let n_super = counts.len();
         let total: usize = counts.iter().sum();

@@ -344,8 +344,26 @@ impl CoarseIndex {
     /// to express itself.
     const MEMBER_SLACK: f64 = 1.5;
 
-    pub fn build(centroids: &[f32], nlist: usize, dim: usize, seed: u64) -> Self {
-        let n_super = (nlist as f64).sqrt().ceil().max(1.0) as usize;
+    /// Build the level over `centroids`, sized for the `probe` the caller will
+    /// use.
+    ///
+    /// `n_super = sqrt(probe * nlist)`, NOT `sqrt(nlist)`. Level-2 work per row
+    /// is `n_super + probe * nlist/n_super`, which is minimised at
+    /// `sqrt(probe * nlist)` -- the naive `sqrt(nlist)` ignores that each row
+    /// visits `probe` supers, and so builds far too few, far too large. The
+    /// difference is not marginal: measured on real centroids at matched
+    /// accuracy (~99% agreement with the exact scan), assigning a 10,000-row
+    /// batch took
+    ///
+    ///   nlist    sqrt(nlist)    sqrt(8*nlist)
+    ///    6,048       220.1 ms         112.7 ms   (1.95x)
+    ///   12,617       365.0 ms         156.7 ms   (2.33x)
+    ///
+    /// so the constant was worth about 2x on its own, and the gap widens with
+    /// nlist.
+    pub fn build(centroids: &[f32], nlist: usize, dim: usize, probe: usize, seed: u64) -> Self {
+        let probe = probe.max(1);
+        let n_super = ((probe * nlist) as f64).sqrt().ceil().max(1.0) as usize;
         let n_super = n_super.min(nlist);
         // Few iterations on purpose: this clusters CENTROIDS, which are
         // already a summary, and a better super level buys accuracy the

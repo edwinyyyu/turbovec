@@ -2423,6 +2423,7 @@ impl FreshIndex {
                     &self.state.centroids,
                     nlist,
                     dim,
+                    HIERARCHY_PROBE_SUPER,
                     KMEANS_SEED ^ nlist as u64,
                 ));
                 self.stats.coarse_rebuilds += 1;
