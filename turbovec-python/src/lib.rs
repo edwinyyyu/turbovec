@@ -2805,6 +2805,13 @@ impl FreshIndex {
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
+    /// Test-only: drop mapped segment pages so the next search pays real I/O.
+    /// Cold latency is otherwise unmeasurable without privileges to purge the
+    /// system page cache.
+    fn evict_page_cache(&self) {
+        self.reader.evict_page_cache();
+    }
+
     fn __len__(&self) -> usize {
         self.reader.len()
     }

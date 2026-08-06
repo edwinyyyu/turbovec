@@ -1253,6 +1253,49 @@ impl IndexState {
 
     /// Scan one partition with a single prepared query, pushing
     /// (score, id) candidates for live rows.
+    /// Drop every segment page this index has mapped, so the next query pays
+    /// real I/O. Test-only: cold latency is otherwise unmeasurable without
+    /// privileges to purge the whole page cache, and every cold figure in the
+    /// design docs is currently DERIVED from per-read microbenchmarks rather
+    /// than measured end to end.
+    ///
+    /// Advisory. `MADV_DONTNEED` is not guaranteed to free file-backed pages
+    /// on Darwin, so a caller must check that the timing actually moved before
+    /// believing the result.
+    #[doc(hidden)]
+    pub fn evict_page_cache(&self) {
+        let maps: Vec<Arc<Mmap>> = {
+            let guard = self.caches.segment_maps.lock().expect("segment map lock");
+            guard.values().cloned().collect()
+        };
+        for m in maps {
+            let len = m.len();
+            if len > 0 {
+                // `madvise` directly: memmap2 gates DONTNEED behind an API
+                // this version does not expose on `Mmap`. Same pattern as
+                // `full_sync`'s raw `fcntl`.
+                //
+                // SAFETY: DONTNEED on a SHARED FILE mapping repopulates from
+                // the file on next access, so no data is lost -- it is
+                // destructive only for private/anonymous mappings, and these
+                // are read-only maps of committed segments. The pointer and
+                // length come from the live mapping.
+                const MADV_DONTNEED: i32 = 4;
+                extern "C" {
+                    fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+                }
+                let _ = unsafe { madvise(m.as_ptr() as *mut _, len, MADV_DONTNEED) };
+            }
+        }
+        // Drop the cached mappings too, so the next query re-mmaps and cannot
+        // read through a mapping whose pages are still resident.
+        self.caches
+            .segment_maps
+            .lock()
+            .expect("segment map lock")
+            .clear();
+    }
+
     /// Advise the kernel about every partition this query will read, BEFORE
     /// reading any of them.
     ///
@@ -1817,6 +1860,12 @@ impl FreshIndex {
 
     fn rotation_for(&self, dim: usize) -> &rotation::Rotation {
         self.state.rotation_for(dim)
+    }
+
+    /// Test-only: drop mapped segment pages so the next query pays real I/O.
+    #[doc(hidden)]
+    pub fn evict_page_cache(&self) {
+        self.state.evict_page_cache()
     }
 
     fn codebook_for(&self, dim: usize) -> &[f32] {
@@ -4729,6 +4778,12 @@ impl FreshReader {
     /// pointer swap — cannot stall a query behind maintenance.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         Arc::clone(&self.published.read().expect("snapshot lock"))
+    }
+
+    /// Test-only: drop mapped segment pages so the next query pays real I/O.
+    #[doc(hidden)]
+    pub fn evict_page_cache(&self) {
+        self.snapshot().state.evict_page_cache()
     }
 
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
