@@ -2855,6 +2855,23 @@ impl FreshIndex {
         self.reader.nlist()
     }
 
+    /// Partition centroids as an ``(nlist, dim)`` float32 array.
+    ///
+    /// For router experiments: what any coarse quantizer costs depends on how
+    /// the centroids are DISTRIBUTED, and synthetic centroids are evenly
+    /// spread in a way real ones are not -- a benchmark that invents its own
+    /// measures a geometry the index never has.
+    #[getter]
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let guard = self.lock_read();
+        let dim = guard.dim();
+        let c = guard.centroids();
+        let nlist = if dim == 0 { 0 } else { c.len() / dim };
+        let flat = c.to_vec();
+        drop(guard);
+        Ok(flat.into_pyarray(py).reshape([nlist, dim])?)
+    }
+
     #[getter]
     fn target_partition_size(&self) -> Option<usize> {
         self.lock_read().partition_target()

@@ -1764,6 +1764,17 @@ impl FreshIndex {
         self.state.nlist()
     }
 
+    /// The partition centroids, `nlist * dim` row-major.
+    ///
+    /// Exposed for router experiments: what a coarse quantizer costs depends
+    /// entirely on how these are DISTRIBUTED, and a benchmark that invents its
+    /// own centroids measures a geometry the index never has -- random
+    /// centroids are evenly spread, real ones clump, and the difference was
+    /// worth 3.5x in measured routing work.
+    pub fn centroids(&self) -> &[f32] {
+        &self.state.centroids
+    }
+
     pub fn base_len(&self) -> usize {
         self.state.base_len()
     }
