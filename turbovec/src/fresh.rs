@@ -646,9 +646,18 @@ const TIER_MERGE_CHUNK_BACKSTOP: usize = 24;
 /// count at O(log entries); this only fires if it is not keeping up.
 const RUN_TIER_BACKSTOP: usize = 24;
 
-/// Below this many partitions a flat scan is already cheap and the hierarchy's
-/// own build cost dominates, so it stays off.
-const HIERARCHY_MIN_NLIST: usize = 256;
+/// Below this many partitions the hierarchy cannot prune enough to pay for
+/// itself, so it stays off.
+///
+/// This is not a soft heuristic about build cost -- it is where the geometry
+/// stops working. Level 2 reaches at most `probe * max_members` centroids, and
+/// with `n_super = sqrt(nlist)` under a 1.5x balance cap that is
+/// `1.5 * probe / sqrt(nlist)` of the index. At `probe = 8` this reaches 75%
+/// at nlist 256 and 37% at 1,024 -- so below ~600 the "hierarchy" scans nearly
+/// everything twice. Measured head to head at 768d, it loses at nlist 390
+/// (0.61x) and wins from 781 (1.22x) and 1,561 (2.06x); 1,024 sits just past
+/// the crossover with margin.
+const HIERARCHY_MIN_NLIST: usize = 1024;
 
 /// Supers probed per row in the two-level assignment. The accuracy dial:
 /// agreement with exact assignment is ~33% at 1, ~85% at 8 (nlist 1024).
