@@ -2199,16 +2199,21 @@ impl DiskIndex {
         let owned_queries = q_slice.to_vec();
         let index = &self.inner;
         let (scores, ids) = py.detach(move || {
-            index.search_with_options(
-                &owned_queries,
-                k,
-                turbovec_core::SearchOptions {
-                    nprobe,
-                    probe_epsilon,
-                    rescore_k,
-                },
-            )
-        });
+            // The process-local pool, not the global one: module init pins the
+            // global pool to a single thread, so a bare detach leaves the whole
+            // scan single-threaded.
+            with_pool(move || {
+                index.search_with_options(
+                    &owned_queries,
+                    k,
+                    turbovec_core::SearchOptions {
+                        nprobe,
+                        probe_epsilon,
+                        rescore_k,
+                    },
+                )
+            })
+        })?;
         let effective_k = if nq == 0 {
             k.min(self.inner.len())
         } else {
@@ -2690,16 +2695,21 @@ impl FreshIndex {
         // any point, so this cannot wait behind a save or a maintain.
         let reader = self.reader.clone();
         let (scores, ids) = py.detach(move || {
-            reader.search_with_options(
-                &owned_queries,
-                k,
-                turbovec_core::SearchOptions {
-                    nprobe,
-                    probe_epsilon,
-                    rescore_k,
-                },
-            )
-        });
+            // The process-local pool, not the global one: module init pins the
+            // global pool to a single thread, so a bare detach leaves the whole
+            // scan single-threaded.
+            with_pool(move || {
+                reader.search_with_options(
+                    &owned_queries,
+                    k,
+                    turbovec_core::SearchOptions {
+                        nprobe,
+                        probe_epsilon,
+                        rescore_k,
+                    },
+                )
+            })
+        })?;
         let effective_k = if nq == 0 {
             k.min(self.reader.len())
         } else {

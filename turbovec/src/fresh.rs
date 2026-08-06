@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 
 use crate::disk::{
     self, closure_assignments_for_vectors, clustering_sample, f32_bytes, route_queries,
@@ -1157,6 +1157,8 @@ impl IndexState {
             (0..nq)
                 .map(|qi| {
                     let single = prepared.single(qi);
+                    // Get every read in flight before touching the first one.
+                    self.prefetch_partitions(&routes[qi]);
                     let mut candidates = Vec::new();
                     for &position in &routes[qi] {
                         self.scan_partition(position as usize, &single, fetch_k, &mut candidates);
@@ -1238,6 +1240,43 @@ impl IndexState {
 
     /// Scan one partition with a single prepared query, pushing
     /// (score, id) candidates for live rows.
+    /// Advise the kernel about every partition this query will read, BEFORE
+    /// reading any of them.
+    ///
+    /// Without this the scan walks partitions in order and faults each one's
+    /// pages on demand, so a query whose pages are not resident pays one full
+    /// I/O round trip per partition at queue depth 1. The same defect was
+    /// measured on the flat disk index at a p95 of 622 ms under memory
+    /// pressure; advising the whole probed set first lets the device see all
+    /// of the reads at once and overlap them.
+    ///
+    /// This is the cold-latency lever for IVF specifically: unlike a graph's
+    /// hops, probed partitions are INDEPENDENT, so their reads have no
+    /// dependency chain and can all be in flight together.
+    ///
+    /// Advisory only — `MADV_WILLNEED` cannot fail the query, only fail to
+    /// help, so errors are deliberately discarded.
+    fn prefetch_partitions(&self, positions: &[u32]) {
+        if positions.len() < 2 {
+            return; // one partition has nothing to overlap with
+        }
+        for &position in positions {
+            let Some(partition) = self.partitions.get(position as usize) else {
+                continue;
+            };
+            if partition.live_rows == 0 {
+                continue;
+            }
+            let Ok(map) = self.segment_map(partition.partition_id, partition.generation) else {
+                continue;
+            };
+            let len = (partition.file_bytes as usize).min(map.len());
+            if len > 0 {
+                let _ = map.advise_range(Advice::WillNeed, 0, len);
+            }
+        }
+    }
+
     fn scan_partition(
         &self,
         position: usize,
