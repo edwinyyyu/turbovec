@@ -2584,9 +2584,11 @@ impl FreshIndex {
             return Vec::new();
         }
         let t = std::time::Instant::now();
-        let packed = pack::packed_from_group_bytes(group_rows, n, self.state.bit_width, dim);
-        let out = decode::decode(
-            &packed,
+        // Straight from group bytes: the bit-plane detour cost 68.6 ms of a
+        // 75 ms pair at n=10,000 x 768d, scattering each code into four planes
+        // for `decode` to gather it back out.
+        let out = decode::decode_groups(
+            group_rows,
             scales,
             n,
             dim,

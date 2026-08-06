@@ -751,9 +751,8 @@ impl GatheredRows {
             group_rows.extend_from_slice(self.row(i));
             scales.push(self.scales[i]);
         }
-        let packed = pack::packed_from_group_bytes(&group_rows, indices.len(), bit_width, dim);
-        decode::decode(
-            &packed,
+        decode::decode_groups(
+            &group_rows,
             &scales,
             indices.len(),
             dim,

@@ -1486,3 +1486,109 @@ mod calibrate_fit_unwind {
         assert_ne!(idx.tqplus_shift(), &pair[..]);
     }
 }
+
+/// Where does decode's time actually go?
+///
+/// `us_assign_decode` is 56% of an assignment at 768d (~95 ms per 10,000-row
+/// save, against the GEMM's ~74 ms), and the bit-plane extraction loop inside
+/// `decode::decode` measured only 3.4 ms of it. So the cost is in one of the
+/// other phases, and attributing it by reading the code has gone wrong twice
+/// today. This times the two halves directly.
+mod decode_phase_bench {
+    use crate::{codebook, decode, pack, rotation};
+
+    #[test]
+    fn decode_phase_split() {
+        let (dim, bits, n) = (768usize, 4usize, 10_000usize);
+        let n_byte_groups = pack::n_byte_groups(bits, dim);
+        let mut rows = vec![0u8; n * n_byte_groups];
+        let mut x = 0x9E3779B97F4A7C15u64;
+        for b in rows.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x >> 24) as u8;
+        }
+        let scales = vec![1.0f32; n];
+        let rot = rotation::Rotation::new(dim);
+        let (_, centroids) = codebook::codebook(bits, dim);
+
+        // Warm, so neither phase pays first-touch on its output buffer.
+        let _ = pack::packed_from_group_bytes(&rows[..n_byte_groups * 64], 64, bits, dim);
+
+        let t = std::time::Instant::now();
+        let packed = pack::packed_from_group_bytes(&rows, n, bits, dim);
+        let unpack_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let t = std::time::Instant::now();
+        let out = decode::decode(
+            &packed, &scales, n, dim, bits, &rot, &centroids, &[], &[],
+        );
+        let decode_ms = t.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&out);
+
+        println!(
+            "n={n} dim={dim} bits={bits}: packed_from_group_bytes {unpack_ms:.1} ms, \
+             decode::decode {decode_ms:.1} ms  (unpack is {:.0}% of the pair)",
+            unpack_ms / (unpack_ms + decode_ms) * 100.0
+        );
+
+        let t = std::time::Instant::now();
+        let direct = decode::decode_groups(
+            &rows, &scales, n, dim, bits, &rot, &centroids, &[], &[],
+        );
+        let direct_ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "  decode_groups (no bit-plane detour) {direct_ms:.1} ms  -> {:.2}x",
+            (unpack_ms + decode_ms) / direct_ms
+        );
+        assert_eq!(
+            out, direct,
+            "decoding straight from group bytes must reproduce the bit-plane \
+             path exactly -- a mismatch silently corrupts every vector",
+        );
+    }
+
+    /// Every bit width and a dim that is not a multiple of the group size,
+    /// including the 3-bit case whose codes sit on 4-bit boundaries.
+    #[test]
+    fn decode_groups_matches_packed_path() {
+        let rot_cache: Vec<usize> = vec![256, 768];
+        for &dim in &rot_cache {
+            for &bits in &[2usize, 3, 4] {
+                let n = 97;
+                let n_byte_groups = pack::n_byte_groups(bits, dim);
+                let mut rows = vec![0u8; n * n_byte_groups];
+                let mut x = 0xDEADBEEFCAFEBABEu64 ^ (dim as u64) ^ ((bits as u64) << 32);
+                for b in rows.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *b = (x >> 24) as u8;
+                }
+                let scales: Vec<f32> = (0..n).map(|i| 0.5 + i as f32 * 0.01).collect();
+                let rot = rotation::Rotation::new(dim);
+                let (_, centroids) = codebook::codebook(bits, dim);
+                // Non-identity TQ+ calibration too: the two front-ends apply it
+                // at the same point, and a divergence there would be invisible
+                // with the identity path alone.
+                let shift: Vec<f32> = (0..dim).map(|d| (d % 7) as f32 * 0.01).collect();
+                let scale: Vec<f32> = (0..dim).map(|d| 1.0 + (d % 5) as f32 * 0.1).collect();
+
+                for (sh, sc) in [(&[][..], &[][..]), (&shift[..], &scale[..])] {
+                    let packed = pack::packed_from_group_bytes(&rows, n, bits, dim);
+                    let via_planes =
+                        decode::decode(&packed, &scales, n, dim, bits, &rot, &centroids, sh, sc);
+                    let direct =
+                        decode::decode_groups(&rows, &scales, n, dim, bits, &rot, &centroids, sh, sc);
+                    assert_eq!(
+                        via_planes, direct,
+                        "dim {dim} bits {bits} calibrated={}: group-byte decode diverged \
+                         from the bit-plane path",
+                        !sh.is_empty(),
+                    );
+                }
+            }
+        }
+    }
+}
