@@ -499,7 +499,7 @@ impl Default for MaintenanceTuning {
             // reassignment's quality gain reach the latency axis at all.
             gc_max_chunks: 4,
             staging_threshold: 0,
-            hierarchical_assign: false,
+            hierarchical_assign: true,
             tier_merge_enabled: true,
             gc_garbage_ratio: 0.5,
             max_rewrites_per_flush: 0,
@@ -647,7 +647,7 @@ const TIER_MERGE_CHUNK_BACKSTOP: usize = 24;
 const RUN_TIER_BACKSTOP: usize = 24;
 
 /// Below this many partitions the hierarchy cannot prune enough to pay for
-/// itself, so it stays off.
+/// itself, so the flat scan is used instead.
 ///
 /// This is not a soft heuristic about build cost -- it is where the geometry
 /// stops working. Level 2 reaches at most `probe * max_members` centroids, and
@@ -663,7 +663,30 @@ const HIERARCHY_MIN_NLIST: usize = 1024;
 /// agreement with exact assignment is ~33% at 1, ~85% at 8 (nlist 1024).
 /// Cost is `(1 + probe)·√nlist` comparisons against `nlist` flat, so the
 /// win still grows with nlist — ~9x at 6,300 partitions, ~35x at 97,656.
-const HIERARCHY_PROBE_SUPER: usize = 8;
+/// Supers probed per row at level 2.
+///
+/// This is the OPERATING POINT, and it turned out to set the build exponent,
+/// not just a constant. Measured over nlist 6,048..55,540 on real centroids,
+/// cost per 10,000-row batch scaled as nlist^0.28 at probe 8 and nlist^0.14 at
+/// probe 4, against nlist^0.95 for the flat scan -- so build goes from N^1.95
+/// to roughly N^1.14. Chasing high agreement is what forces the exponent back
+/// up, and agreement is not what matters: a row in its second-nearest
+/// partition is still found by a query that probes many, and LIRE reassigns
+/// the rest. Agreement drifts only 93.5% -> 91.8% across that whole range, and
+/// measured end to end at 768d the recall difference is under 0.4%.
+const HIERARCHY_PROBE_SUPER: usize = 4;
+
+/// Experiment hook for the probe sweep. The probe is the operating point,
+/// and the operating point turned out to set the BUILD EXPONENT (0.28 at
+/// probe 8 against 0.14 at probe 4, measured over nlist 6k..55k), so it is
+/// swept rather than argued.
+fn hierarchy_probe_super() -> usize {
+    std::env::var("TURBOVEC_PROBE_SUPER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(HIERARCHY_PROBE_SUPER)
+}
 
 /// Largest tolerated size ratio between the two children of a split.
 const SPLIT_BALANCE_RATIO: f32 = 1.5;
@@ -2423,7 +2446,7 @@ impl FreshIndex {
                     &self.state.centroids,
                     nlist,
                     dim,
-                    HIERARCHY_PROBE_SUPER,
+                    hierarchy_probe_super(),
                     KMEANS_SEED ^ nlist as u64,
                 ));
                 self.stats.coarse_rebuilds += 1;
@@ -2434,7 +2457,7 @@ impl FreshIndex {
             // neighbouring super). 8 lifts it to 85-95%, and recall tolerates
             // more than agreement does because search probes many partitions
             // anyway.
-            coarse.assign(&vectors, batch.n, &self.state.centroids, HIERARCHY_PROBE_SUPER)
+            coarse.assign(&vectors, batch.n, &self.state.centroids, hierarchy_probe_super())
         } else {
             // Top of a flush, one large batch, not inside any parallel loop:
             // take every core. The ambient check cannot see this, because the
