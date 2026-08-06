@@ -659,6 +659,26 @@ const RUN_TIER_BACKSTOP: usize = 24;
 /// the crossover with margin.
 const HIERARCHY_MIN_NLIST: usize = 1024;
 
+/// How many centroid candidates the read-path hierarchy gathers per `nprobe`.
+///
+/// Routing must return the best `nprobe` partitions, and the hierarchy can only
+/// return partitions it looked at. A pool the size of `nprobe` would drop any
+/// good partition sitting in an unprobed super, and the loss shows up as recall,
+/// not as an error -- so the pool carries deliberate headroom. Measured against
+/// the exact flat route, top-10 overlap by headroom: 1 -> 60.6%, 2 -> 81.0%,
+/// 4 -> 93.4%, 8 -> 99.6%. Routing is not self-correcting the way assignment
+/// is, so this is set where the curve flattens, not where it is cheapest.
+const READ_CANDIDATE_HEADROOM: usize = 8;
+
+/// Experiment hook for the headroom sweep; removed once the constant is settled.
+fn read_candidate_headroom() -> usize {
+    std::env::var("TURBOVEC_READ_HEADROOM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(READ_CANDIDATE_HEADROOM)
+}
+
 /// Supers probed per row in the two-level assignment. The accuracy dial:
 /// agreement with exact assignment is ~33% at 1, ~85% at 8 (nlist 1024).
 /// Cost is `(1 + probe)·√nlist` comparisons against `nlist` flat, so the
@@ -817,6 +837,12 @@ struct IndexState {
     tqplus_shift: Vec<f32>,
     tqplus_scale: Vec<f32>,
     centroids: Arc<Vec<f32>>,
+    /// Two-level index over `centroids`, shared with readers.
+    ///
+    /// Derived data, but published rather than rebuilt per snapshot: it costs
+    /// O(nlist^1.5) to build and a reader must not pay that. Behind an `Arc`
+    /// like everything else here, so publishing it is a refcount bump.
+    coarse: Option<Arc<kmeans::CoarseIndex>>,
     partitions: Vec<Arc<PartitionState>>,
     runs: Arc<Vec<u64>>,
     memtable: Arc<RwLock<MemtableCell>>,
@@ -1174,15 +1200,57 @@ impl IndexState {
                         }
                     })
                     .clamp(1, nlist);
-                route_queries(
-                    queries,
-                    nq,
-                    dim,
-                    &self.centroids,
-                    nlist,
-                    nprobe_cap,
-                    options.probe_epsilon,
-                )
+                match self.coarse.as_deref() {
+                    // Route through the hierarchy when one is published and
+                    // large enough to prune. The candidate pool is sized from
+                    // `nprobe`, not fixed: routing must return the best
+                    // `nprobe` partitions, and unlike a misassignment -- which
+                    // reassignment repairs -- a misroute is permanent for that
+                    // query.
+                    // The pool is `headroom * nprobe`, so the hierarchy only
+                    // prunes when nprobe is a SMALL fraction of nlist. At the
+                    // default nprobe (nlist/8) the pool is the whole centroid
+                    // table and the two levels are pure overhead. It pays where
+                    // it matters -- the measured scan fraction falls with scale
+                    // (~0.17% at 100M), which is exactly where a flat centroid
+                    // scan hurts.
+                    Some(coarse)
+                        if nlist >= HIERARCHY_MIN_NLIST
+                            && nprobe_cap.saturating_mul(read_candidate_headroom()) * 2 < nlist =>
+                    {
+                        if std::env::var("TVDBG_ROUTE").is_ok() {
+                            eprintln!(
+                                "  [route] HIER nlist={nlist} built_for={} centroids={}",
+                                coarse.built_for,
+                                self.centroids.len() / dim
+                            );
+                        }
+                        route_queries_hier(
+                        queries,
+                        nq,
+                        dim,
+                        &self.centroids,
+                        coarse,
+                        nprobe_cap,
+                        options.probe_epsilon,
+                    )
+                    }
+                    _ => {
+                        if std::env::var("TVDBG_ROUTE").is_ok() {
+                            eprintln!("  [route] FLAT nlist={nlist} coarse={}",
+                                      self.coarse.is_some());
+                        }
+                        route_queries(
+                        queries,
+                        nq,
+                        dim,
+                        &self.centroids,
+                        nlist,
+                        nprobe_cap,
+                        options.probe_epsilon,
+                    )
+                    }
+                }
             } else {
                 vec![(0..nlist as u32).collect(); nq]
             };
@@ -1626,7 +1694,7 @@ pub struct FreshIndex {
     /// Two-level quantizer over the centroids, rebuilt when nlist has moved
     /// materially rather than on every centroid touch — it clusters a summary,
     /// so a slightly stale level costs a little accuracy, not correctness.
-    coarse: Option<kmeans::CoarseIndex>,
+    coarse: Option<Arc<kmeans::CoarseIndex>>,
     next_partition_id: u32,
     next_run_generation: u64,
     churn_since_check: u64,
@@ -1663,6 +1731,7 @@ impl FreshIndex {
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             centroids: Arc::new(Vec::new()),
+            coarse: None,
             partitions: Vec::new(),
             runs: Arc::new(Vec::new()),
             memtable: MemtableCell::new(memtable),
@@ -2287,6 +2356,26 @@ impl FreshIndex {
             self.maintenance(dim, &mut entries, &mut dropped_files)?;
         }
         self.stats.us_maintenance = t_maint.elapsed().as_micros() as u64;
+
+        // Refresh the coarse level against the POST-maintenance centroid table,
+        // so the snapshot about to be published routes over every partition
+        // that exists in it. Bounded by the same staleness rule, so this is not
+        // a per-flush cost.
+        if self.tuning.hierarchical_assign {
+            let nlist_now = self.state.partitions.len();
+            let needs = nlist_now >= HIERARCHY_MIN_NLIST
+                && self.state.clustered
+                && match &self.coarse {
+                    None => true,
+                    Some(c) => {
+                        nlist_now < c.built_for
+                            || nlist_now as f64 / c.built_for.max(1) as f64 > 1.05
+                    }
+                };
+            if needs {
+                self.refresh_coarse(nlist_now, dim);
+            }
+        }
         let t_publish = std::time::Instant::now();
 
         // Publish: run file, manifest, WAL reset, then cleanup.
@@ -2419,6 +2508,34 @@ impl FreshIndex {
     /// of which the allocation floor is the part that does not scale with
     /// nlist). Replication is off in the recommended design, so the common
     /// path does not need the nesting.
+    /// Rebuild the coarse level for the CURRENT centroid table and publish it.
+    ///
+    /// Called at the end of a flush, after maintenance, not from inside
+    /// assignment. Assignment runs BEFORE maintenance, so a level built there
+    /// is built from the pre-maintenance centroids -- and every partition the
+    /// following split/dissolve pass creates is then absent from every member
+    /// list. For assignment that is harmless (those rows get reassigned later);
+    /// for ROUTING it is not, because a centroid no member list names can never
+    /// be probed, and the query never learns it missed one. Measured: with the
+    /// level built during assignment, `built_for` trailed `nlist` by ~25% and
+    /// read-path overlap with the exact route saturated at 77% no matter how
+    /// large the candidate pool was.
+    fn refresh_coarse(&mut self, nlist: usize, dim: usize) {
+        let built = Arc::new(kmeans::CoarseIndex::build(
+            &self.state.centroids,
+            nlist,
+            dim,
+            hierarchy_probe_super(),
+            KMEANS_SEED ^ nlist as u64,
+        ));
+        // Published, not writer-private: the read path routes through the same
+        // structure, and rebuilding it per snapshot would cost a reader
+        // O(nlist^1.5).
+        self.state.coarse = Some(Arc::clone(&built));
+        self.coarse = Some(built);
+        self.stats.coarse_rebuilds += 1;
+    }
+
     fn assign_batch_single(&mut self, batch: &RowBatch, dim: usize) -> Vec<u32> {
         let nlist = self.state.partitions.len();
         if !self.state.clustered || nlist <= 1 {
@@ -2435,23 +2552,23 @@ impl FreshIndex {
             // save.
             let stale = match &self.coarse {
                 None => true,
-                Some(c) => {
-                    let grown = nlist.max(c.built_for) as f64;
-                    let shrunk = nlist.min(c.built_for) as f64;
-                    grown / shrunk.max(1.0) > 1.2
-                }
+                // ANY shrink forces a rebuild, not just a large one. The member
+                // lists hold centroid ids up to `built_for - 1`, and a dissolve
+                // renumbers partitions, so a level built for 1,000 centroids
+                // used against 900 indexes out of bounds -- a panic on the
+                // assignment path and, since the level is now published, on the
+                // query path too. The symmetric ratio this replaced called a
+                // 1,000 -> 900 shrink "fresh" (1.11 < 1.2).
+                //
+                // Growth stays on the 20% rule: every id remains in range, and
+                // the only cost of staleness is that the newest centroids are
+                // not yet reachable, which reassignment absorbs.
+                Some(c) => nlist < c.built_for || nlist as f64 / c.built_for.max(1) as f64 > 1.2,
             };
             if stale {
-                self.coarse = Some(kmeans::CoarseIndex::build(
-                    &self.state.centroids,
-                    nlist,
-                    dim,
-                    hierarchy_probe_super(),
-                    KMEANS_SEED ^ nlist as u64,
-                ));
-                self.stats.coarse_rebuilds += 1;
+                self.refresh_coarse(nlist, dim);
             }
-            let coarse = self.coarse.as_ref().expect("just built");
+            let coarse = self.coarse.as_ref().expect("just refreshed");
             // Agreement with exact assignment at probe=1 is only ~33-37%
             // (Voronoi boundaries: a row's nearest centroid often sits in the
             // neighbouring super). 8 lifts it to 85-95%, and recall tolerates
@@ -4413,6 +4530,7 @@ impl FreshIndex {
             tqplus_shift,
             tqplus_scale,
             centroids: Arc::new(centroids),
+            coarse: None,
             partitions: partitions.into_iter().map(Arc::new).collect(),
             runs: Arc::new(runs),
             memtable: MemtableCell::new(memtable),
@@ -4955,4 +5073,60 @@ mod dead_in_tests {
             }
         }
     }
+}
+
+/// Rank partitions per query through the coarse hierarchy instead of a flat
+/// scan over every centroid.
+///
+/// Same contract as [`crate::disk::route_queries`]: up to `nprobe` partition
+/// ids per query, nearest first, optionally cut at the SPANN epsilon bound.
+/// The difference is which centroids get scored — only the members of the
+/// query's nearest supers, gathered until the pool is `READ_CANDIDATE_HEADROOM`
+/// times `nprobe`.
+///
+/// The headroom is the whole safety argument. The hierarchy can only return
+/// partitions it looked at, so a pool barely larger than `nprobe` would silently
+/// drop good partitions that happen to sit in an unprobed super, and the loss
+/// would show up as recall rather than as an error.
+fn route_queries_hier(
+    queries: &[f32],
+    nq: usize,
+    dim: usize,
+    centroids: &[f32],
+    coarse: &kmeans::CoarseIndex,
+    nprobe: usize,
+    probe_epsilon: Option<f32>,
+) -> Vec<Vec<u32>> {
+    let want = nprobe.saturating_mul(read_candidate_headroom()).max(nprobe);
+    (0..nq)
+        .map(|qi| {
+            let query = &queries[qi * dim..(qi + 1) * dim];
+            let mut cand = Vec::new();
+            coarse.candidates(query, want, &mut cand);
+            let query_sq_norm: f32 = query.iter().map(|&v| v * v).sum();
+            let mut ranked: Vec<(f32, u32)> = cand
+                .iter()
+                .map(|&c| {
+                    let center = &centroids[c as usize * dim..(c as usize + 1) * dim];
+                    let mut dot = 0.0f32;
+                    let mut sq = 0.0f32;
+                    for (a, b) in query.iter().zip(center) {
+                        dot += a * b;
+                        sq += b * b;
+                    }
+                    ((query_sq_norm + sq - 2.0 * dot).max(0.0), c)
+                })
+                .collect();
+            ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            ranked.truncate(nprobe);
+            if let Some(epsilon) = probe_epsilon {
+                if let Some(&(best, _)) = ranked.first() {
+                    let bound = best * (1.0 + epsilon) * (1.0 + epsilon);
+                    let cut = ranked.partition_point(|&(sq_dist, _)| sq_dist <= bound);
+                    ranked.truncate(cut.max(1));
+                }
+            }
+            ranked.into_iter().map(|(_, c)| c).collect()
+        })
+        .collect()
 }

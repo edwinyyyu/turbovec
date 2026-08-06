@@ -434,6 +434,50 @@ impl CoarseIndex {
             .collect()
     }
 
+    /// Centroid ids worth scoring for one query: the members of its nearest
+    /// supers, taken until at least `want` candidates are gathered.
+    ///
+    /// The READ path differs from assignment in a way that matters. Assignment
+    /// needs the single best centroid, so a fixed `probe` suffices and any
+    /// error is repaired later by reassignment. Routing needs the best `nprobe`
+    /// partitions, and an error there is NOT repairable — a query sent to the
+    /// wrong partitions returns worse results, permanently. So the super count
+    /// is driven by how many candidates are needed rather than fixed: probe
+    /// supers until the member pool covers `want`, which makes the headroom
+    /// over `nprobe` explicit and keeps it constant as nlist grows.
+    ///
+    /// Returns ids in no particular order; the caller scores and ranks them.
+    pub fn candidates(&self, query: &[f32], want: usize, out: &mut Vec<u32>) {
+        out.clear();
+        let dim = self.dim;
+        if self.n_super == 0 {
+            return;
+        }
+        let mut ranked: Vec<(f32, u32)> = Vec::with_capacity(self.n_super);
+        for s in 0..self.n_super {
+            let center = &self.supers[s * dim..(s + 1) * dim];
+            // Ranking only, so the query's own norm is a shared constant and
+            // drops out: ||q-c||^2 = ||q||^2 + ||c||^2 - 2q.c.
+            let mut dot = 0.0f32;
+            let mut sq = 0.0f32;
+            for (a, b) in query.iter().zip(center) {
+                dot += a * b;
+                sq += b * b;
+            }
+            ranked.push((sq - 2.0 * dot, s as u32));
+        }
+        ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+        for &(_, s) in &ranked {
+            let lo = self.member_offsets[s as usize] as usize;
+            let hi = self.member_offsets[s as usize + 1] as usize;
+            out.extend_from_slice(&self.members[lo..hi]);
+            if out.len() >= want {
+                break;
+            }
+        }
+    }
+
     /// Assign `n` rows to centroids through the hierarchy.
     ///
     /// Rows are grouped by their chosen super before the second level so that

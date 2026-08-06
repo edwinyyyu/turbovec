@@ -18,6 +18,13 @@ use rayon::prelude::*;
 
 /// Reconstruct `n` approximate vectors from bit-plane packed codes.
 /// Returns a flat `n * dim` array.
+///
+/// No production caller remains — every reconstruction path now uses
+/// [`decode_groups`], which skips the bit-plane round trip. Kept as the
+/// reference implementation that `decode_groups_matches_packed_path` checks
+/// against: an independent second path is what makes that equality assertion
+/// worth anything.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode(
     packed_codes: &[u8],
