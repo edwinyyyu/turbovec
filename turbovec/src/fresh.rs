@@ -1154,7 +1154,20 @@ impl IndexState {
             } else {
                 vec![(0..nlist as u32).collect(); nq]
             };
+            // Parallel over QUERIES, not just over blocks within one scan.
+            //
+            // Batching bought only 1.12x before this: the routing GEMM and
+            // query prep are shared across the batch, but they are small, and
+            // the scan -- which dominates -- ran one query at a time.
+            //
+            // The nesting is deliberate and self-correcting. At nq == 1 this
+            // is a one-element parallel iterator, so an interactive query still
+            // gets `search::scan`'s block-level parallelism inside. At larger
+            // nq the workers are already inside the pool, so `should_parallelise`
+            // sees a rayon context and keeps each inner scan serial -- which is
+            // what the guard exists for, and exactly right here.
             (0..nq)
+                .into_par_iter()
                 .map(|qi| {
                     let single = prepared.single(qi);
                     // Get every read in flight before touching the first one.
