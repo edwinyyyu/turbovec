@@ -2855,6 +2855,35 @@ impl FreshIndex {
         self.reader.nlist()
     }
 
+    /// What the index STORES for each id -- decoded quantized codes, not the
+    /// originals -- as an ``(len(ids), dim)`` float32 array.
+    ///
+    /// For controlled index comparisons: handing another index these
+    /// reconstructions gives both structures identical information, so a
+    /// recall difference is attributable to the SEARCH STRUCTURE rather than to
+    /// the encoder. Matching bit width is not enough — faiss's 4-bit scalar
+    /// quantizer and its `QT_4bit_tq` reach different ceilings, and both differ
+    /// from ours.
+    ///
+    /// Ids that are absent or removed yield a zero row.
+    fn reconstruct<'py>(
+        &self,
+        py: Python<'py>,
+        ids: PyReadonlyArray1<'_, u64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let ids = ids.as_slice()?;
+        let guard = self.lock_read();
+        let dim = guard.dim();
+        let mut out = vec![0.0f32; ids.len() * dim];
+        for (i, &id) in ids.iter().enumerate() {
+            if let Some(v) = guard.reconstruct(id) {
+                out[i * dim..(i + 1) * dim].copy_from_slice(&v);
+            }
+        }
+        drop(guard);
+        Ok(out.into_pyarray(py).reshape([ids.len(), dim])?)
+    }
+
     /// Partition centroids as an ``(nlist, dim)`` float32 array.
     ///
     /// For router experiments: what any coarse quantizer costs depends on how

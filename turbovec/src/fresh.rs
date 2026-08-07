@@ -1911,6 +1911,28 @@ impl FreshIndex {
         self.state.get_vector(id)
     }
 
+    /// What the index actually STORES for `id`: the decoded quantized code,
+    /// not the original vector.
+    ///
+    /// `get_vector` returns the original and requires `store_vectors`; this
+    /// returns the reconstruction, which is what every distance computation in
+    /// the index is really made of.
+    ///
+    /// Exists to make an index comparison controllable. Comparing our IVF
+    /// against a graph over DIFFERENTLY quantized codes conflates two
+    /// variables — the search structure and the encoder — and a bit-width
+    /// match is not an encoder match (faiss's 4-bit scalar and its `QT_4bit_tq`
+    /// reach different ceilings, both unlike ours). Feeding a graph these
+    /// reconstructions gives both structures identical information, so what
+    /// remains is the structure.
+    pub fn reconstruct(&self, id: u64) -> Option<Vec<f32>> {
+        let dim = self.dim_opt()?;
+        let copies = self.state.live_copies(id);
+        let primary = copies.iter().find(|c| !c.is_replica)?;
+        let (group_row, scale, _) = self.copy_row_data(*primary, dim).ok()?;
+        Some(self.decode_group_rows(&group_row, &[scale], 1, dim))
+    }
+
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
         self.state.search(queries, k)
     }
